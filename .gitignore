@@ -1,0 +1,6 @@
+.env
+secrets/
+node_modules/
+output/
+input/
+.history/
