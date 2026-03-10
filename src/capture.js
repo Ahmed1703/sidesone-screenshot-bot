@@ -1,8 +1,9 @@
+// src/capture.js
+require("dotenv").config();
+
 const fs = require("fs");
 const path = require("path");
 const { chromium } = require("playwright");
-
-const ROOT = path.join(__dirname, "..");
 
 // Output stays on D:
 const DEFAULT_OUT_DIR =
@@ -20,6 +21,8 @@ const LOGS_DIR = path.join(OUT_DIR, "logs");
   fs.mkdirSync(dir, { recursive: true });
 });
 
+const DEFAULT_VIEWPORT = { width: 1440, height: 900 };
+
 function safeFileName(str) {
   return String(str || "")
     .trim()
@@ -32,6 +35,31 @@ function safeFileName(str) {
     .slice(0, 120);
 }
 
+/**
+ * Normalizes any legacy/new values to:
+ *   "top" | "full" | "sections"
+ */
+function normalizeMode(value) {
+  const v = String(value || "").trim().toLowerCase();
+
+  if (v === "top" || v === "hero" || v === "cheap") return "top";
+  if (v === "full" || v === "fullpage" || v === "page") return "full";
+  if (v === "sections" || v === "recommended" || v === "precision" || v === "3")
+    return "sections";
+
+  // Safe default (matches your new system normalization)
+  return "sections";
+}
+
+function getModeFromEnv() {
+  return (
+    process.env.SCREENSHOT_MODE ||
+    process.env.SCREENSHOT_STRATEGY ||
+    process.env.SIDESONE_SCREENSHOT_MODE ||
+    ""
+  );
+}
+
 async function dismissCommonPopups(page) {
   const selectors = [
     'button:has-text("Godta")',
@@ -42,7 +70,7 @@ async function dismissCommonPopups(page) {
     'button:has-text("OK")',
     '[id*="cookie"] button',
     '[class*="cookie"] button',
-    '[aria-label*="cookie" i] button'
+    '[aria-label*="cookie" i] button',
   ];
 
   for (const selector of selectors) {
@@ -53,9 +81,7 @@ async function dismissCommonPopups(page) {
         await page.waitForTimeout(600);
         return true;
       }
-    } catch (_) {
-      // try next selector
-    }
+    } catch (_) {}
   }
   return false;
 }
@@ -71,7 +97,7 @@ async function autoScroll(page) {
             document.documentElement?.scrollHeight || 0,
             document.body?.scrollHeight || 0
           ),
-          7000 // enough to trigger lazy loading without being too slow
+          7000
         );
 
         const timer = setInterval(() => {
@@ -86,9 +112,7 @@ async function autoScroll(page) {
         }, 120);
       });
     });
-  } catch (_) {
-    // ignore scroll errors
-  }
+  } catch (_) {}
 }
 
 async function tryGoto(page, rawUrl) {
@@ -104,7 +128,7 @@ async function tryGoto(page, rawUrl) {
     try {
       const response = await page.goto(url, {
         waitUntil: "domcontentloaded",
-        timeout: 15000
+        timeout: 25000,
       });
       return { ok: true, response, attemptedUrl: url };
     } catch (err) {
@@ -128,16 +152,97 @@ async function getPageMetrics(page) {
       html ? html.offsetHeight : 0
     );
 
-    return {
-      pageHeight: Number(pageHeight) || 0
-    };
+    return { pageHeight: Number(pageHeight) || 0 };
   });
 }
 
-async function captureWebsite(rawUrl, customId = "") {
-  const browser = await chromium.launch({ headless: true });
+async function scrollTo(page, y, waitMs = 650) {
+  await page.evaluate((yy) => window.scrollTo(0, yy), y);
+  await page.waitForTimeout(waitMs);
+}
 
-  const fileBase = safeFileName(customId ? `${customId}_${rawUrl}` : rawUrl);
+async function captureTop(page, outDir, fileBase, result) {
+  await scrollTo(page, 0, 500);
+
+  const topPath = path.join(outDir, `${fileBase}_top.jpg`);
+  await page.screenshot({ path: topPath, type: "jpeg", quality: 75 });
+
+  result.desktop_top_path = topPath;
+  result.image_paths = [topPath];
+}
+
+async function captureFull(page, outDir, fileBase, result) {
+  await scrollTo(page, 0, 500);
+
+  const fullPath = path.join(outDir, `${fileBase}_full.jpg`);
+  await page.screenshot({
+    path: fullPath,
+    type: "jpeg",
+    quality: 75,
+    fullPage: true,
+  });
+
+  result.desktop_full_path = fullPath;
+  result.image_paths = [fullPath];
+}
+
+async function captureSections(page, outDir, fileBase, result) {
+  const metrics = await getPageMetrics(page);
+  result.page_height = metrics.pageHeight;
+
+  const viewport = page.viewportSize() || DEFAULT_VIEWPORT;
+  const viewportHeight = viewport.height;
+
+  const topY = 0;
+  const maxScrollableY = Math.max(0, metrics.pageHeight - viewportHeight);
+  const midY = Math.max(0, Math.floor(maxScrollableY / 2));
+  const bottomY = maxScrollableY;
+
+  result.top_scroll_y = topY;
+  result.mid_scroll_y = midY;
+  result.bottom_scroll_y = bottomY;
+
+  // TOP
+  await scrollTo(page, topY, 500);
+  const topPath = path.join(outDir, `${fileBase}_top.jpg`);
+  await page.screenshot({ path: topPath, type: "jpeg", quality: 75 });
+  result.desktop_top_path = topPath;
+
+  // MID
+  await scrollTo(page, midY, 700);
+  const midPath = path.join(outDir, `${fileBase}_mid.jpg`);
+  await page.screenshot({ path: midPath, type: "jpeg", quality: 75 });
+  result.desktop_mid_path = midPath;
+
+  // BOTTOM
+  await scrollTo(page, bottomY, 700);
+  const bottomPath = path.join(outDir, `${fileBase}_bottom.jpg`);
+  await page.screenshot({ path: bottomPath, type: "jpeg", quality: 75 });
+  result.desktop_bottom_path = bottomPath;
+
+  result.image_paths = [topPath, midPath, bottomPath];
+}
+
+/**
+ * captureWebsite(rawUrl, {
+ *   screenshotMode?: "top"|"full"|"sections"|"recommended"|...legacy,
+ *   outDir?: string,
+ *   disableAutoScroll?: boolean,
+ * })
+ *
+ * - If screenshotMode not provided, reads from env:
+ *     SCREENSHOT_MODE / SCREENSHOT_STRATEGY / SIDESONE_SCREENSHOT_MODE
+ */
+async function captureWebsite(rawUrl, opts = {}) {
+  const requestedMode =
+    opts.screenshotMode !== undefined ? opts.screenshotMode : getModeFromEnv();
+  const screenshotMode = normalizeMode(requestedMode);
+
+  const outDir = opts.outDir || DESKTOP_DIR;
+
+  // IMPORTANT: keep filename stable based on URL ONLY
+  // so analyze-manifest can find the right manifest using just the url.
+  const fileBase = safeFileName(rawUrl);
 
   const result = {
     input_url: rawUrl,
@@ -145,102 +250,80 @@ async function captureWebsite(rawUrl, customId = "") {
     final_url: null,
     homepage_title: null,
 
+    screenshot_mode_requested: String(requestedMode || ""),
+    screenshot_mode_used: screenshotMode,
+
     capture_status: "failed",
     capture_error: null,
+    capture_warning: null,
 
     desktop_top_path: null,
     desktop_mid_path: null,
     desktop_bottom_path: null,
+    desktop_full_path: null,
 
-    viewport_desktop: { width: 1440, height: 900 },
+    image_paths: [],
+
+    viewport_desktop: { ...DEFAULT_VIEWPORT },
     page_height: null,
     top_scroll_y: 0,
     mid_scroll_y: null,
     bottom_scroll_y: null,
 
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
   };
 
-  try {
-    const desktopContext = await browser.newContext({
-      viewport: { width: 1440, height: 900 }
-    });
+  const browser = await chromium.launch({ headless: true });
 
-    const page = await desktopContext.newPage();
+  try {
+    fs.mkdirSync(outDir, { recursive: true });
+
+    const context = await browser.newContext({ viewport: DEFAULT_VIEWPORT });
+    const page = await context.newPage();
 
     const nav = await tryGoto(page, rawUrl);
     if (!nav.ok) throw nav.error;
 
     result.attempted_url = nav.attemptedUrl;
 
-    // Let page settle
-    await page.waitForTimeout(1800);
+    // settle
+    await page.waitForTimeout(1200);
 
-    // Try closing cookie banners
+    // cookies
     await dismissCommonPopups(page);
 
-    // Trigger lazy-loaded content/images
-    await autoScroll(page);
+    // Only autoscroll when it helps (full/sections). Top is cheap mode.
+    const disableAutoScroll =
+      typeof opts.disableAutoScroll === "boolean"
+        ? opts.disableAutoScroll
+        : screenshotMode === "top";
 
-    // Settle again
-    await page.waitForTimeout(1000);
+    if (!disableAutoScroll) {
+      await autoScroll(page);
+      await page.waitForTimeout(900);
+    }
 
     result.final_url = page.url();
     result.homepage_title = await page.title();
 
-    const metrics = await getPageMetrics(page);
-    result.page_height = metrics.pageHeight;
+    if (screenshotMode === "top") {
+      await captureTop(page, outDir, fileBase, result);
+    } else if (screenshotMode === "full") {
+      try {
+        await captureFull(page, outDir, fileBase, result);
+      } catch (e) {
+        // rare: fullPage fails on extremely long pages / memory issues
+        result.capture_warning = `fullPage failed, fell back to sections: ${
+          e && e.message ? e.message : String(e)
+        }`;
+        result.screenshot_mode_used = "sections";
+        await captureSections(page, outDir, fileBase, result);
+      }
+    } else {
+      await captureSections(page, outDir, fileBase, result);
+    }
 
-    const viewport = page.viewportSize() || { width: 1440, height: 900 };
-    const viewportHeight = viewport.height;
-
-    // Scroll positions
-    const topY = 0;
-    const maxScrollableY = Math.max(0, metrics.pageHeight - viewportHeight);
-    const midY = Math.max(0, Math.floor(maxScrollableY / 2));
-    const bottomY = maxScrollableY;
-
-    result.mid_scroll_y = midY;
-    result.bottom_scroll_y = bottomY;
-
-    // ---------- 1) TOP ----------
-    await page.evaluate((y) => window.scrollTo(0, y), topY);
-    await page.waitForTimeout(500);
-
-    const topPath = path.join(DESKTOP_DIR, `${fileBase}_top.jpg`);
-    await page.screenshot({
-      path: topPath,
-      type: "jpeg",
-      quality: 75
-    });
-    result.desktop_top_path = topPath;
-
-    // ---------- 2) MID ----------
-    await page.evaluate((y) => window.scrollTo(0, y), midY);
-    await page.waitForTimeout(700);
-
-    const midPath = path.join(DESKTOP_DIR, `${fileBase}_mid.jpg`);
-    await page.screenshot({
-      path: midPath,
-      type: "jpeg",
-      quality: 75
-    });
-    result.desktop_mid_path = midPath;
-
-    // ---------- 3) BOTTOM ----------
-    await page.evaluate((y) => window.scrollTo(0, y), bottomY);
-    await page.waitForTimeout(700);
-
-    const bottomPath = path.join(DESKTOP_DIR, `${fileBase}_bottom.jpg`);
-    await page.screenshot({
-      path: bottomPath,
-      type: "jpeg",
-      quality: 75
-    });
-    result.desktop_bottom_path = bottomPath;
-
-    await desktopContext.close();
-
+    await context.close();
     result.capture_status = "success";
   } catch (err) {
     result.capture_error = err && err.message ? err.message : String(err);
@@ -255,23 +338,22 @@ async function captureWebsite(rawUrl, customId = "") {
 }
 
 // CLI usage:
-// node src/capture.js example.com
+// node src/capture.js example.com [top|full|sections]
 if (require.main === module) {
   const url = process.argv[2];
+  const mode = process.argv[3];
 
   if (!url) {
-    console.error("Usage: node src/capture.js <url>");
+    console.error("Usage: node src/capture.js <url> [top|full|sections]");
     process.exit(1);
   }
 
-  captureWebsite(url)
-    .then((res) => {
-      console.log(JSON.stringify(res, null, 2));
-    })
+  captureWebsite(url, { screenshotMode: mode })
+    .then((res) => console.log(JSON.stringify(res, null, 2)))
     .catch((err) => {
       console.error("Fatal error:", err);
       process.exit(1);
     });
 }
 
-module.exports = { captureWebsite };
+module.exports = { captureWebsite, normalizeMode };
