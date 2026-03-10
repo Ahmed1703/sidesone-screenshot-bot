@@ -4,13 +4,15 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "capture": "node src/capture.js"
+    "capture": "node src/capture.js",
+    "worker": "node src/job-runner.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@upstash/redis": "^1.36.3",
     "dotenv": "^17.3.1",
     "googleapis": "^171.4.0",
     "openai": "^6.25.0",
