@@ -4,8 +4,6 @@ const path = require("path");
 require("dotenv").config();
 const OpenAI = require("openai");
 
-const { buildAnalyzerPrompt } = require("./analyzer-prompt");
-
 // ✅ Use env var so this works on VPS/Linux too
 const OUT_DIR = process.env.OUTPUT_DIR || "D:\\sidesone-screenshot-output";
 const MANIFEST_DIR = path.join(OUT_DIR, "manifests");
@@ -38,7 +36,6 @@ function safeFileName(str) {
 }
 
 function getManifestPath(input) {
-  // allow either: "mpower.one" OR full path to manifest json
   if (String(input || "").toLowerCase().endsWith(".json")) {
     return path.isAbsolute(input) ? input : path.join(process.cwd(), input);
   }
@@ -65,7 +62,11 @@ function normalizeComment(text) {
 }
 
 function extractTextFromResponse(response) {
-  if (response && typeof response.output_text === "string" && response.output_text.trim()) {
+  if (
+    response &&
+    typeof response.output_text === "string" &&
+    response.output_text.trim()
+  ) {
     return response.output_text.trim();
   }
 
@@ -86,178 +87,23 @@ function extractTextFromResponse(response) {
   }
 }
 
-// ✅ Guarantees the model never includes your email intro / greeting
-function sanitizeOutreachComment(input) {
-  let t = String(input || "").replace(/\r/g, "").trim();
+function cleanGeneratedText(input) {
+  let text = String(input || "").replace(/\r/g, "").trim();
 
-  // Remove code fences / quotes
-  t = t.replace(/```[\s\S]*?```/g, "").trim();
-  t = t.replace(/^["'“”‘’\s]+/, "").trim();
+  text = text.replace(/```[\s\S]*?```/g, "").trim();
+  text = text.replace(/^["'“”‘’]+|["'“”‘’]+$/g, "").trim();
+  text = text.replace(/\n{3,}/g, "\n\n").trim();
+  text = text.replace(/[ \t]+/g, " ").trim();
 
-  // Remove greeting
-  t = t.replace(/^hei[,!.\s]+/i, "").trim();
-
-  // Remove repeated email intro variants at the start
-  t = t.replace(
-    /^(jeg\s+tokk?\s+en\s+titt\s+gjennom\s+nettsiden\s+deres\s+og\s+la\s+merke\s+til\s+at[\s,:.-]*)/i,
-    ""
-  ).trim();
-
-  t = t.replace(
-    /^(jeg\s+tokk?\s+en\s+titt\s+gjennom\s+nettsiden\s+deres[\s,:.-]*)/i,
-    ""
-  ).trim();
-
-  t = t.replace(
-    /^(jeg\s+la\s+merke\s+til\s+at[\s,:.-]*)/i,
-    ""
-  ).trim();
-
-  // Force lowercase start
-  t = t.replace(/^([A-ZÆØÅ])/, (m) => m.toLowerCase());
-
-  // Collapse weird whitespace
-  t = t.replace(/\s+/g, " ").trim();
-
-  return t;
+  return text;
 }
 
-
-function splitSentences(text) {
-  return String(text || "")
-    .split(/(?<=[.!?])\s+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
-function startsWithForbiddenIntro(text) {
-  const t = String(text || "").trim().toLowerCase();
-
-  return (
-    /^hei\b/.test(t) ||
-    /^jeg\s+tokk?\s+en\s+titt\s+gjennom\s+nettsiden\s+deres\b/.test(t) ||
-    /^jeg\s+la\s+merke\s+til\s+at\b/.test(t)
-  );
-}
-
-function ensureSentenceEnding(text) {
-  const t = String(text || "").trim().replace(/[.!?]+$/g, "");
-  return t ? `${t}.` : "";
-}
-
-function buildSafeFallbackComment() {
-  return [
-    "nettsiden deres har et greit utgangspunkt visuelt.",
-    "Det er bra, men oppsettet og flyten kunne vært tydeligere.",
-    "Det gjør at førsteinntrykket kan føles litt mindre gjennomført enn det kunne vært.",
-    "Vi ser flere konkrete ting som kunne blitt forbedret her, blant annet.",
-  ].join(" ");
-}
-
-function repairOutreachComment(input) {
-  let cleaned = sanitizeOutreachComment(input);
-  let sentences = splitSentences(cleaned);
-
-  if (sentences.length < 2) {
-    return buildSafeFallbackComment();
+function safeJsonParse(input) {
+  try {
+    return JSON.parse(String(input || "").trim());
+  } catch {
+    return null;
   }
-
-  if (sentences.length === 2) {
-    sentences = [
-      sentences[0],
-      sentences[1],
-      "Det gjør at siden kan føles litt mindre tydelig visuelt",
-      "Vi ser flere konkrete ting som kunne blitt forbedret her, blant annet",
-    ];
-  } else if (sentences.length === 3) {
-    sentences = [
-      sentences[0],
-      sentences[1],
-      sentences[2],
-      "Vi ser flere konkrete ting som kunne blitt forbedret her, blant annet",
-    ];
-  } else if (sentences.length > 4) {
-    sentences = [
-      sentences[0],
-      sentences[1],
-      sentences.slice(2, -1).join(" "),
-      sentences[sentences.length - 1],
-    ];
-  }
-
-  if (!sentences[0] || /^det er bra,\s*men/i.test(sentences[0])) {
-    sentences[0] = "nettsiden deres har et greit utgangspunkt visuelt";
-  }
-
-  let second = String(sentences[1] || "").trim();
-  second = second.replace(/^det er bra,\s*men\s*/i, "").trim();
-
-  if (!second) {
-    second = "oppsettet og flyten kunne vært tydeligere";
-  }
-
-  second = second.charAt(0).toLowerCase() + second.slice(1);
-  sentences[1] = `Det er bra, men ${second}`;
-
-  if (!sentences[2]) {
-    sentences[2] =
-      "Det gjør at siden kan føles litt mindre gjennomført ved førsteinntrykk";
-  }
-
-  let fourth = String(sentences[3] || "").trim().replace(/[.!?]+$/g, "");
-  fourth = fourth.replace(/,\s*blant annet$/i, "").trim();
-  fourth = fourth.replace(/\bblant annet\b$/i, "").trim();
-
-  if (!fourth) {
-    fourth = "Vi ser flere konkrete ting som kunne blitt forbedret her";
-  }
-
-  sentences[0] = ensureSentenceEnding(sentences[0]);
-  sentences[1] = ensureSentenceEnding(sentences[1]);
-  sentences[2] = ensureSentenceEnding(sentences[2]);
-  sentences[3] = `${fourth}, blant annet.`;
-
-  const finalText = sanitizeOutreachComment(sentences.join(" "));
-  const validation = validateOutreachComment(finalText);
-
-  return validation.ok ? finalText : buildSafeFallbackComment();
-}
-
-function validateOutreachComment(text) {
-  const cleaned = String(text || "").trim();
-  const sentences = splitSentences(cleaned);
-
-  if (!cleaned) return { ok: false, reason: "Empty output" };
-  if (startsWithForbiddenIntro(cleaned)) {
-    return { ok: false, reason: "Repeated email intro" };
-  }
-  if (sentences.length !== 4) {
-    return { ok: false, reason: "Not exactly 4 sentences" };
-  }
-  if (!sentences[1]?.toLowerCase().startsWith("det er bra, men")) {
-    return { ok: false, reason: "Sentence 2 format invalid" };
-  }
-  if (!/blant annet\.$/i.test(sentences[3] || "")) {
-    return { ok: false, reason: "Sentence 4 ending invalid" };
-  }
-
-  return { ok: true, reason: "" };
-}
-
-function buildInputBundle(manifest) {
-  const paths = [
-    { role: "top", path: manifest.desktop_top_path },
-    { role: "mid", path: manifest.desktop_mid_path },
-    { role: "bottom", path: manifest.desktop_bottom_path },
-  ].filter((x) => x.path && fs.existsSync(x.path));
-
-  return {
-    paths,
-    pageHeight: manifest.page_height ?? null,
-    viewportHeight: manifest.viewport_desktop?.height ?? null,
-    homepageTitle: manifest.homepage_title || "",
-    finalUrl: manifest.final_url || manifest.input_url || "",
-  };
 }
 
 function buildInputBundle(manifest) {
@@ -286,33 +132,41 @@ async function analyzeWithMock(manifest, bundle) {
     bundle.pageHeight <= bundle.viewportHeight + 50;
 
   return {
-    status: "ok",
-    primary_category: isShort ? "hero" : "spacing",
-    severity: isShort ? "low" : "medium",
-    page_length_hint: isShort ? "short" : "normal",
-    observations: isShort
-      ? [
-          {
-            category: "hero",
-            severity: "low",
-            comment_no:
-              "Forsiden virker ganske kort, så top, mid og bunn blir nesten samme utsnitt i analysen.",
-          },
-        ]
-      : [
-          {
-            category: "spacing",
-            severity: "medium",
-            comment_no:
-              "Siden har nok høyde til å vurdere struktur, men spacing og seksjonsrytme bør vurderes ut fra top, mid og bunn samlet.",
-          },
-        ],
-    best_outreach_line_no: isShort
-      ? "Nettsiden virker ganske kort i oppsettet, så førsteinntrykket blir fort over."
-      : "Nettsiden har innhold, men oppsett og spacing mellom seksjoner kan bli tydeligere visuelt.",
+    mode: "mock",
+    screenshotModeUsed: getCurrentScreenshotMode(),
+    page_type: "real_site",
+    confidence: 0.6,
+    should_generate_comment: true,
+    score: isShort ? 5 : 6,
+    strengths: isShort
+      ? ["Siden virker enkel og oversiktlig i toppseksjonen."]
+      : ["Siden har nok innhold til å kunne vurderes visuelt."],
+    issues: isShort
+      ? ["Forsiden virker ganske kort og litt tynn visuelt."]
+      : ["Oppsett og spacing kunne vært tydeligere visuelt."],
+    evidence: isShort
+      ? ["Topputsnittet virker kort og inneholder lite variasjon."]
+      : ["Det er nok innhold til å se struktur, men helheten virker enkel."],
+    visible_signals: {
+      has_nav: true,
+      has_headline: true,
+      has_cta: false,
+      has_contact_info: false,
+      has_multiple_sections: !isShort,
+      mostly_blank: false,
+      error_like: false,
+      placeholder_like: false,
+    },
+    reason_short: isShort
+      ? "The homepage is short and simple."
+      : "The page is usable but visually basic.",
+    comment_no: isShort
+      ? "Forsiden virker ganske enkel og litt kort, så førsteinntrykket blir fort svakere enn det kunne vært."
+      : "Nettsiden har innhold nok til å fungere, men oppsett og spacing kunne vært tydeligere visuelt.",
+    raw_output_text: "",
+    raw_analysis_json: "",
   };
 }
-
 
 function getCurrentScreenshotMode() {
   return String(
@@ -324,7 +178,6 @@ function getCurrentScreenshotMode() {
     .trim()
     .toLowerCase();
 }
-
 
 function getImagePathsForMode(manifest) {
   const screenshotMode = getCurrentScreenshotMode();
@@ -367,39 +220,290 @@ function getImagePathsForMode(manifest) {
   throw new Error("Top screenshot missing");
 }
 
+const PAGE_ANALYSIS_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  properties: {
+    page_type: {
+      type: "string",
+      enum: [
+        "real_site",
+        "placeholder_page",
+        "parking_page",
+        "thin_page",
+        "broken_page",
+        "unreachable",
+        "social_only",
+        "platform_listing",
+        "under_construction",
+        "unclear",
+      ],
+    },
+    confidence: { type: "number", minimum: 0, maximum: 1 },
+    should_generate_comment: { type: "boolean" },
+    score: { type: "integer", minimum: 0, maximum: 10 },
+    strengths: {
+      type: "array",
+      items: { type: "string" },
+      maxItems: 3,
+    },
+    issues: {
+      type: "array",
+      items: { type: "string" },
+      maxItems: 6,
+    },
+    evidence: {
+      type: "array",
+      items: { type: "string" },
+      maxItems: 8,
+    },
+    reason_short: { type: "string" },
+    visible_signals: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        has_nav: { type: "boolean" },
+        has_headline: { type: "boolean" },
+        has_cta: { type: "boolean" },
+        has_contact_info: { type: "boolean" },
+        has_multiple_sections: { type: "boolean" },
+        mostly_blank: { type: "boolean" },
+        error_like: { type: "boolean" },
+        placeholder_like: { type: "boolean" },
+      },
+      required: [
+        "has_nav",
+        "has_headline",
+        "has_cta",
+        "has_contact_info",
+        "has_multiple_sections",
+        "mostly_blank",
+        "error_like",
+        "placeholder_like",
+      ],
+    },
+  },
+  required: [
+    "page_type",
+    "confidence",
+    "should_generate_comment",
+    "score",
+    "strengths",
+    "issues",
+    "evidence",
+    "reason_short",
+    "visible_signals",
+  ],
+};
+
+function buildFallbackStructuredAnalysis(reason) {
+  return {
+    page_type: "unclear",
+    confidence: 0.2,
+    should_generate_comment: false,
+    score: 0,
+    strengths: [],
+    issues: ["The page could not be classified safely."],
+    evidence: [String(reason || "Could not classify page safely.")],
+    reason_short: String(reason || "Could not classify page safely."),
+    visible_signals: {
+      has_nav: false,
+      has_headline: false,
+      has_cta: false,
+      has_contact_info: false,
+      has_multiple_sections: false,
+      mostly_blank: false,
+      error_like: false,
+      placeholder_like: false,
+    },
+  };
+}
+
+function normalizeStructuredAnalysis(data) {
+  const fallback = buildFallbackStructuredAnalysis(
+    "Could not normalize structured analysis"
+  );
+
+  const normalized = {
+    page_type: String(data?.page_type || fallback.page_type),
+    confidence: Number.isFinite(Number(data?.confidence))
+      ? Math.max(0, Math.min(1, Number(data.confidence)))
+      : fallback.confidence,
+    should_generate_comment: Boolean(data?.should_generate_comment),
+    score: Number.isFinite(Number(data?.score))
+      ? Math.max(0, Math.min(10, Math.round(Number(data.score))))
+      : fallback.score,
+    strengths: Array.isArray(data?.strengths)
+      ? data.strengths
+          .map((x) => String(x || "").trim())
+          .filter(Boolean)
+          .slice(0, 3)
+      : [],
+    issues: Array.isArray(data?.issues)
+      ? data.issues
+          .map((x) => String(x || "").trim())
+          .filter(Boolean)
+          .slice(0, 6)
+      : [],
+    evidence: Array.isArray(data?.evidence)
+      ? data.evidence
+          .map((x) => String(x || "").trim())
+          .filter(Boolean)
+          .slice(0, 8)
+      : [],
+    reason_short: String(data?.reason_short || fallback.reason_short).trim(),
+    visible_signals: {
+      has_nav: Boolean(data?.visible_signals?.has_nav),
+      has_headline: Boolean(data?.visible_signals?.has_headline),
+      has_cta: Boolean(data?.visible_signals?.has_cta),
+      has_contact_info: Boolean(data?.visible_signals?.has_contact_info),
+      has_multiple_sections: Boolean(data?.visible_signals?.has_multiple_sections),
+      mostly_blank: Boolean(data?.visible_signals?.mostly_blank),
+      error_like: Boolean(data?.visible_signals?.error_like),
+      placeholder_like: Boolean(data?.visible_signals?.placeholder_like),
+    },
+  };
+
+  if (!normalized.issues.length) {
+    normalized.issues = fallback.issues;
+  }
+  if (!normalized.evidence.length) {
+    normalized.evidence = [normalized.reason_short || fallback.reason_short];
+  }
+
+  return normalized;
+}
+
+function buildLanguageAwareFallbackComment(structured, languageArg = "no") {
+  const isEnglish = String(languageArg || "no").toLowerCase() === "en";
+
+  const pageType = String(structured?.page_type || "unclear");
+  const issue1 = String(structured?.issues?.[0] || "").trim();
+  const issue2 = String(
+    structured?.issues?.[1] || structured?.evidence?.[0] || ""
+  ).trim();
+  const reason = String(
+    structured?.reason_short || structured?.evidence?.[0] || ""
+  ).trim();
+
+  if (
+    pageType !== "real_site" ||
+    !structured?.should_generate_comment ||
+    Number(structured?.confidence || 0) < 0.55
+  ) {
+    if (isEnglish) {
+      return (
+        "this does not look like a normal finished business website in the screenshots, " +
+        "so it would be misleading to write a standard website critique here."
+      );
+    }
+
+    return (
+      "dette ser ikke ut som en vanlig ferdig bedriftsnettside i skjermbildene, " +
+      "så det blir misvisende å skrive en vanlig nettsidekommentar her."
+    );
+  }
+
+  if (isEnglish) {
+    const first =
+      issue1 || "the page structure and clarity are weaker than they should be";
+    const second =
+      issue2 ||
+      reason ||
+      "that makes the first impression feel weaker than it should";
+
+    return `the main issue is that ${first.replace(/^[A-Z]/, (m) =>
+      m.toLowerCase()
+    )}. ${second.replace(/^[a-z]/, (m) => m.toUpperCase())}.`;
+  }
+
+  const first =
+    issue1 || "strukturen og tydeligheten på siden er svakere enn den burde være";
+  const second =
+    issue2 ||
+    reason ||
+    "det gjør at førsteinntrykket føles svakere enn det burde";
+
+  return `hovedproblemet er at ${first.replace(/^[A-ZÆØÅ]/, (m) =>
+    m.toLowerCase()
+  )}. ${second.replace(/^[a-zæøå]/, (m) => m.toUpperCase())}.`;
+}
+
 // ----------------------
 // REAL AI analyzer (OpenAI Responses API)
 // ----------------------
-// ✅ Added promptOverride so presets can control the prompt
-async function analyzeWithAI(manifest, bundle, languageArg, engineArg, promptOverride = "") {
-  const engine = String(engineArg || process.env.ANALYZER_MODE || "openai").toLowerCase();
+async function analyzeWithAI(
+  manifest,
+  bundle,
+  languageArg,
+  engineArg,
+  promptOverride = ""
+) {
+  const engine = String(
+    engineArg || process.env.ANALYZER_MODE || "openai"
+  ).toLowerCase();
 
   if (engine === "mock") return analyzeWithMock(manifest, bundle);
-  if (engine !== "openai") throw new Error(`Unsupported ANALYZER_MODE: ${engine}`);
+  if (engine !== "openai") {
+    throw new Error(`Unsupported ANALYZER_MODE: ${engine}`);
+  }
 
   const apiKey = process.env.OPENAI_API_KEY;
   const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
   if (!apiKey) throw new Error("OPENAI_API_KEY is missing in .env");
 
-  // ✅ Screenshot mode comes from env set by job-runner
-   const screenshotMode = getCurrentScreenshotMode();
-   const imagePaths = getImagePathsForMode(manifest);
+  const screenshotMode = getCurrentScreenshotMode();
+  const imagePaths = getImagePathsForMode(manifest);
 
-  // ✅ Prompt selection:
-  // - if promptOverride provided (preset prompt), use it
-  // - else fallback to default analyzer-prompt
-  const prompt = String(promptOverride || "").trim();
+  const isEnglish = String(languageArg || "no").toLowerCase() === "en";
+  const outputLanguageName = isEnglish ? "English" : "Norwegian Bokmål";
 
-if (!prompt) {
-  throw new Error("No preset prompt resolved for this job.");
-}
+  const prompt =
+    String(promptOverride || "").trim() ||
+    (isEnglish
+      ? "Write a short, natural website outreach comment based only on what is clearly visible. Do not greet. Do not say that you looked at the site. Keep it concrete, human, and specific."
+      : "Skriv en kort og naturlig nettsidekommentar for outreach basert kun på det som er tydelig synlig. Ikke hils. Ikke skriv at du har sett på nettsiden. Hold det konkret, menneskelig og spesifikt.");
 
   const client = new OpenAI({ apiKey });
 
-  const response = await client.responses.create({
+  const sharedContext =
+    `CONTEXT (from capture manifest):\n` +
+    `- URL: ${manifest.final_url || manifest.attempted_url || manifest.input_url || "unknown"}\n` +
+    `- Title: ${manifest.homepage_title || "unknown"}\n` +
+    `- Page height: ${manifest.page_height || "unknown"}\n` +
+    `- Viewport: ${manifest.viewport_desktop?.width || 1440}x${manifest.viewport_desktop?.height || 900}\n` +
+    `- Image order: ${imagePaths.length === 3 ? "TOP, MID, BOTTOM" : "TOP"}\n`;
+
+  const imageContent = imagePaths.map((imgPath) => ({
+    type: "input_image",
+    image_url: imageToDataUrl(imgPath),
+  }));
+
+  // -----------------------
+  // STAGE 1: STRICT CLASSIFICATION
+  // -----------------------
+  const classifyResponse = await client.responses.create({
     model,
+    temperature: 0.2,
+    text: {
+      format: {
+        type: "json_schema",
+        name: "website_page_analysis",
+        strict: true,
+        schema: PAGE_ANALYSIS_SCHEMA,
+      },
+    },
     instructions:
-      "You are analyzing website screenshots for a Norwegian cold outreach comment. Follow the user's provided rules exactly and return only the requested plain text output.",
+      "You are a strict website screenshot classifier. " +
+      "Classify what the page actually is before any outreach writing. " +
+      "Never invent strengths. Never give fake praise. " +
+      "Score visual design quality, not business legitimacy or completeness. " +
+      "A site can be real, complete, and usable while still having weak or outdated visual design. " +
+      "Do not reward a site with a high score just because it has many sections, testimonials, contact details, or a navigation menu. " +
+      "Focus strengths and issues on what is visually apparent: layout balance, spacing, hierarchy, typography, density, section clarity, CTA clarity, consistency, polish, and whether the design feels modern or dated. " +
+      "Do not mostly summarize what content exists on the page. " +
+      "Do not treat local language as a weakness if the site clearly targets a local market, especially a .no site aimed at Norwegian users. " +
+      "If the screenshots look blank, broken, parked, placeholder-like, under construction, or too thin to judge safely, set should_generate_comment=false.",
     input: [
       {
         role: "user",
@@ -407,96 +511,153 @@ if (!prompt) {
           {
             type: "input_text",
             text:
-              `${prompt}\n\n` +
-              `KONTEKST (fra capture-manifest):\n` +
-              `- URL: ${manifest.final_url || manifest.attempted_url || manifest.input_url || "ukjent"}\n` +
-              `- Tittel: ${manifest.homepage_title || "ukjent"}\n` +
-              `- Sidehøyde: ${manifest.page_height || "ukjent"}\n` +
-              `- Viewport: ${manifest.viewport_desktop?.width || 1440}x${manifest.viewport_desktop?.height || 900}\n\n` +
-              `Bilderekkefølge er: ${imagePaths.length === 3 ? "TOP, MID, BOTTOM" : "TOP"}.`,
+              `${sharedContext}\n` +
+              `Task:\n` +
+              `1. Classify the page strictly.\n` +
+              `2. Decide whether it is appropriate to generate a normal website comment.\n` +
+              `3. Include strengths only if they are truly visible and visually meaningful.\n` +
+              `4. Evidence must be concrete observations from the screenshots, not generic advice.\n` +
+              `5. Separate website completeness from visual design quality.\n\n` +
+              `Important:\n` +
+              `- Use "real_site" only when this clearly looks like an actual business website with enough content to judge.\n` +
+              `- If the page looks blank, temporary, parked, broken, placeholder-like, or very thin, set should_generate_comment=false.\n` +
+              `- Score means visual design quality only.\n` +
+              `- A real business website can still score low if it looks outdated, basic, heavy, cramped, messy, or visually weak.\n` +
+              `- Do not use “the site is in Norwegian” as an issue for a Norwegian local business site.\n` +
+              `- Prefer issues about outdated styling, heavy sections, weak spacing, weak hierarchy, dense text, uneven balance, basic typography, or low visual polish.\n` +
+              `- Do not write outreach text yet. Return classification data only.\n`,
           },
-          ...imagePaths.map((imgPath) => ({
-            type: "input_image",
-            image_url: imageToDataUrl(imgPath),
-          })),
+          ...imageContent,
         ],
       },
     ],
-    max_output_tokens: 300,
+    max_output_tokens: 900,
   });
 
-   let rawText = normalizeComment(extractTextFromResponse(response));
-if (!rawText) throw new Error("Model returned empty text output");
+  const rawStructuredText = normalizeComment(
+    extractTextFromResponse(classifyResponse)
+  );
+  const parsedStructured = safeJsonParse(rawStructuredText);
+  const structured = normalizeStructuredAnalysis(
+    parsedStructured ||
+      buildFallbackStructuredAnalysis(
+        "Could not parse structured analysis JSON"
+      )
+  );
 
-let cleaned = repairOutreachComment(rawText);
-let validation = validateOutreachComment(cleaned);
-
-// Retry once if it broke the format
-if (!validation.ok) {
-  console.log("First outreach output invalid, retrying once:", validation.reason);
-
-  const retryResponse = await client.responses.create({
-    model,
-    instructions:
-      "Return only the final website comment in plain text. Do not greet. Do not repeat the email intro. The comment is inserted after the sentence 'Hei, jeg tokk en titt gjennom nettsiden deres og la merke til at'. Start directly with the actual comment. Exactly 4 sentences. Sentence 2 must start with 'Det er bra, men'. Sentence 4 must end with 'blant annet.'.",
-    input: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text:
-              `${prompt}\n\n` +
-              `Your previous output was invalid because: ${validation.reason}.\n` +
-              `Fix it now.\n\n` +
-              `KONTEKST (fra capture-manifest):\n` +
-              `- URL: ${manifest.final_url || manifest.attempted_url || manifest.input_url || "ukjent"}\n` +
-              `- Tittel: ${manifest.homepage_title || "ukjent"}\n` +
-              `- Sidehøyde: ${manifest.page_height || "ukjent"}\n` +
-              `- Viewport: ${manifest.viewport_desktop?.width || 1440}x${manifest.viewport_desktop?.height || 900}\n\n` +
-              `Bilderekkefølge er: ${imagePaths.length === 3 ? "TOP, MID, BOTTOM" : "TOP"}.`,
-          },
-          ...imagePaths.map((imgPath) => ({
-            type: "input_image",
-            image_url: imageToDataUrl(imgPath),
-          })),
-        ],
-      },
-    ],
-    max_output_tokens: 300,
-  });
-
-  rawText = normalizeComment(extractTextFromResponse(retryResponse));
-  if (!rawText) {
-    rawText = buildSafeFallbackComment();
-  }
-
-  cleaned = repairOutreachComment(rawText);
-  validation = validateOutreachComment(cleaned);
-
-  if (!validation.ok) {
-    console.warn(
-      "Outreach output still invalid after retry, using safe fallback:",
-      validation.reason
+  if (
+    structured.page_type !== "real_site" ||
+    !structured.should_generate_comment ||
+    structured.confidence < 0.55
+  ) {
+    const fallbackComment = buildLanguageAwareFallbackComment(
+      structured,
+      languageArg
     );
-    cleaned = buildSafeFallbackComment();
+
+    return {
+      mode: "openai",
+      model,
+      screenshotModeUsed: screenshotMode,
+      page_type: structured.page_type,
+      confidence: structured.confidence,
+      should_generate_comment: structured.should_generate_comment,
+      score: structured.score,
+      strengths: structured.strengths,
+      issues: structured.issues,
+      evidence: structured.evidence,
+      visible_signals: structured.visible_signals,
+      reason_short: structured.reason_short,
+      comment_no: fallbackComment,
+      raw_output_text: fallbackComment,
+      raw_analysis_json: rawStructuredText,
+    };
   }
-}
+
+  // -----------------------
+  // STAGE 2: FINAL WRITING
+  // -----------------------
+  const commentResponse = await client.responses.create({
+    model,
+    temperature: 0.3,
+    instructions:
+      `You are writing the final visible outreach text in ${outputLanguageName}. ` +
+      `Follow the provided style rules exactly. ` +
+      `Use only the structured analysis provided. ` +
+      `Do not invent positives. ` +
+      `If there is no clear positive, begin with a neutral factual observation instead. ` +
+      `Write like a short visual audit, not a summary of page contents. ` +
+      `At most one short positive observation is allowed, then move quickly to the main weakness. ` +
+      `Focus more on what feels outdated, heavy, basic, cramped, visually weak, or less polished. ` +
+      `Do not mostly describe products, features, sections, or company claims. ` +
+      `Do not criticize the site for being in Norwegian if it clearly targets a Norwegian market. ` +
+      `Do not greet. ` +
+      `Do not repeat any email intro unless the style rules explicitly require it. ` +
+      `Do not mention screenshots, AI, tools, browsing, or technical limitations. ` +
+      `Return plain text only.`,
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text:
+              `WRITING STYLE RULES:\n${prompt}\n\n` +
+              `LANGUAGE REQUIRED:\n${outputLanguageName}\n\n` +
+              `STRUCTURED FACTS THAT MUST BE FOLLOWED:\n${JSON.stringify(
+                structured,
+                null,
+                2
+              )}\n\n` +
+              `Write the final visible outreach text now. ` +
+              `It must sound concrete, believable, and based on what is actually visible. ` +
+              `It should feel like a short critique of visual quality and clarity, not a summary of what the company offers.`,
+          },
+        ],
+      },
+    ],
+    max_output_tokens: 260,
+  });
+
+  let rawText = normalizeComment(extractTextFromResponse(commentResponse));
+  rawText = cleanGeneratedText(rawText);
+
+  if (!rawText) {
+    rawText = buildLanguageAwareFallbackComment(structured, languageArg);
+  }
+
+  const cleaned =
+    cleanGeneratedText(rawText) ||
+    buildLanguageAwareFallbackComment(structured, languageArg);
 
   return {
     mode: "openai",
     model,
     screenshotModeUsed: screenshotMode,
+    page_type: structured.page_type,
+    confidence: structured.confidence,
+    should_generate_comment: structured.should_generate_comment,
+    score: structured.score,
+    strengths: structured.strengths,
+    issues: structured.issues,
+    evidence: structured.evidence,
+    visible_signals: structured.visible_signals,
+    reason_short: structured.reason_short,
     comment_no: cleaned,
     raw_output_text: rawText,
+    raw_analysis_json: rawStructuredText,
   };
 }
 
 /* ======================
    STAGE 2: FULL ANALYSIS
 ====================== */
-// ✅ Added promptOverride arg so job-runner can inject preset prompt
-async function runAnalysis(input, languageArg = "no", engineArg = "openai", promptOverride = "") {
+async function runAnalysis(
+  input,
+  languageArg = "no",
+  engineArg = "openai",
+  promptOverride = ""
+) {
   const manifestPath = getManifestPath(input);
   if (!fs.existsSync(manifestPath)) {
     throw new Error(`Manifest not found: ${manifestPath}`);
@@ -508,7 +669,13 @@ async function runAnalysis(input, languageArg = "no", engineArg = "openai", prom
   }
 
   const bundle = buildInputBundle(manifest);
-  const analysis = await analyzeWithAI(manifest, bundle, languageArg, engineArg, promptOverride);
+  const analysis = await analyzeWithAI(
+    manifest,
+    bundle,
+    languageArg,
+    engineArg,
+    promptOverride
+  );
 
   const result = {
     source_manifest: manifestPath,
@@ -540,25 +707,52 @@ async function runScoreOnlyAnalysis(input, languageArg = "no", engineArg = "open
   const manifestPath = getManifestPath(input);
 
   if (!fs.existsSync(manifestPath)) {
-    return { reachable: false, score: 0, severity: "low", reason: "Manifest not found" };
+    return {
+      reachable: false,
+      score: 0,
+      severity: "low",
+      reason: "Manifest not found",
+      page_type: "unreachable",
+    };
   }
 
   const manifest = readJson(manifestPath);
 
   if (manifest.capture_status !== "success") {
-    return { reachable: false, score: 0, severity: "low", reason: "Capture failed/unreachable" };
+    return {
+      reachable: false,
+      score: 0,
+      severity: "low",
+      reason: "Capture failed/unreachable",
+      page_type: "unreachable",
+    };
   }
 
   let imagePaths = [];
   try {
     imagePaths = getImagePathsForMode(manifest);
   } catch (err) {
-    return { reachable: false, score: 0, severity: "low", reason: "Screenshot selection failed" };
+    return {
+      reachable: false,
+      score: 0,
+      severity: "low",
+      reason: "Screenshot selection failed",
+      page_type: "unreachable",
+    };
   }
 
-  const engine = String(engineArg || process.env.ANALYZER_MODE || "openai").toLowerCase();
+  const engine = String(
+    engineArg || process.env.ANALYZER_MODE || "openai"
+  ).toLowerCase();
+
   if (engine === "mock") {
-    return { reachable: true, score: 5, severity: "medium", reason: "Mock score" };
+    return {
+      reachable: true,
+      score: 5,
+      severity: "medium",
+      reason: "Mock score",
+      page_type: "real_site",
+    };
   }
 
   const apiKey = process.env.OPENAI_API_KEY;
@@ -570,7 +764,7 @@ async function runScoreOnlyAnalysis(input, languageArg = "no", engineArg = "open
   const response = await client.responses.create({
     model,
     instructions:
-      "Return ONLY valid JSON with keys: reachable (boolean), score (1-10 integer), severity (low|medium|high), reason (short string). No markdown, no code fences.",
+      "Return ONLY valid JSON with keys: reachable (boolean), score (0-10 integer), severity (low|medium|high), reason (short string), page_type (string). No markdown. No code fences.",
     input: [
       {
         role: "user",
@@ -578,14 +772,23 @@ async function runScoreOnlyAnalysis(input, languageArg = "no", engineArg = "open
           {
             type: "input_text",
             text:
-              "Quickly qualify this website based only on the visible screenshots.\n" +
-              "Use a strict, stable scale:\n" +
-              "1-2 = broken, error-like, very outdated or messy\n" +
-              "3-4 = weak visual quality\n" +
-              "5-6 = acceptable but mixed\n" +
-              "7-8 = good and solid\n" +
-              "9-10 = very polished and excellent\n" +
-              "If it looks like 404, browser error, access denied, forbidden, blocked, not authorized, domain for sale, parked domain, blank page, coming soon, under construction, or otherwise not like a real usable website: set reachable=false and score=0.\n" +
+              "Quickly qualify this website based only on the visible screenshots.\n\n" +
+              "IMPORTANT:\n" +
+              "- Score ONLY visual design quality.\n" +
+              "- Do NOT reward the site just because it is real, complete, trustworthy, or has a lot of information.\n" +
+              "- A real business website can still have weak visual design.\n" +
+              "- Do NOT use these as reasons for a high score by themselves: menu exists, testimonials exist, contact info exists, many sections exist, business looks legitimate.\n" +
+              "- Focus on how modern or outdated it looks, visual polish, spacing, typography, layout balance, hierarchy, consistency, density, clarity of sections, and overall first impression.\n" +
+              "- Do NOT treat Norwegian language on a .no / Norwegian local business site as a design weakness.\n\n" +
+              "Use this strict scale:\n" +
+              "0 = not a real usable website / unreachable / broken / parked / placeholder\n" +
+              "1-2 = broken-looking, extremely outdated, or very poor visual quality\n" +
+              "3-4 = weak / clearly outdated visual design\n" +
+              "5-6 = acceptable but basic, mixed, or only somewhat polished\n" +
+              "7-8 = strong and polished visual design\n" +
+              "9-10 = excellent, modern, highly polished visual design\n\n" +
+              "If it looks like a 404 page, browser error, forbidden page, parked domain, domain for sale page, blank page, coming soon page, maintenance page, or otherwise not like a real usable website, set reachable=false, score=0, and page_type to one of: unreachable, broken_page, parking_page, placeholder_page, under_construction.\n\n" +
+              "If it looks like a real website, set page_type=real_site.\n" +
               "Return ONLY JSON.",
           },
           ...imagePaths.map((imgPath) => ({
@@ -595,7 +798,7 @@ async function runScoreOnlyAnalysis(input, languageArg = "no", engineArg = "open
         ],
       },
     ],
-    max_output_tokens: 180,
+    max_output_tokens: 220,
   });
 
   const raw = normalizeComment(extractTextFromResponse(response));
@@ -603,14 +806,22 @@ async function runScoreOnlyAnalysis(input, languageArg = "no", engineArg = "open
 
   try {
     const parsed = JSON.parse(cleaned);
+
     return {
       reachable: Boolean(parsed.reachable),
       score: Math.max(0, Math.min(10, Number(parsed.score) || 0)),
       severity: String(parsed.severity || "medium"),
       reason: String(parsed.reason || ""),
+      page_type: String(parsed.page_type || (parsed.reachable ? "real_site" : "unreachable")),
     };
   } catch {
-    return { reachable: true, score: 5, severity: "medium", reason: "Could not parse score JSON" };
+    return {
+      reachable: true,
+      score: 5,
+      severity: "medium",
+      reason: "Could not parse score JSON",
+      page_type: "real_site",
+    };
   }
 }
 
@@ -619,7 +830,7 @@ async function runScoreOnlyAnalysis(input, languageArg = "no", engineArg = "open
 // ======================
 module.exports = { runAnalysis, runScoreOnlyAnalysis };
 
-// Keep CLI support (still works, presets override is used by worker not CLI)
+// Keep CLI support
 if (require.main === module) {
   const input = process.argv[2];
   const languageArg = process.argv[3] || "no";
