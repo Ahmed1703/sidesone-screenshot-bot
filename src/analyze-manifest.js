@@ -1,4 +1,3 @@
-// src/analyze-manifest.js
 const fs = require("fs");
 const path = require("path");
 require("dotenv").config();
@@ -73,6 +72,7 @@ function extractTextFromResponse(response) {
   try {
     const chunks = [];
     const output = Array.isArray(response?.output) ? response.output : [];
+
     for (const item of output) {
       const content = Array.isArray(item?.content) ? item.content : [];
       for (const c of content) {
@@ -81,6 +81,7 @@ function extractTextFromResponse(response) {
         }
       }
     }
+
     return chunks.join("\n").trim();
   } catch (_) {
     return "";
@@ -104,6 +105,47 @@ function safeJsonParse(input) {
   } catch {
     return null;
   }
+}
+
+function splitSentences(text) {
+  return String(text || "")
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function ensureSentence(text) {
+  const value = String(text || "").trim();
+  if (!value) return "";
+  if (/[.!?…]$/.test(value)) return value;
+  return `${value}.`;
+}
+
+function lowerFirst(text) {
+  const value = String(text || "").trim();
+  if (!value) return "";
+  return value.charAt(0).toLowerCase() + value.slice(1);
+}
+
+function upperFirst(text) {
+  const value = String(text || "").trim();
+  if (!value) return "";
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function uniqueCaseInsensitive(items = []) {
+  const seen = new Set();
+  const out = [];
+
+  for (const item of items) {
+    const value = String(item || "").trim();
+    const key = value.toLowerCase();
+    if (!value || seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+  }
+
+  return out;
 }
 
 function buildInputBundle(manifest) {
@@ -131,19 +173,21 @@ async function analyzeWithMock(manifest, bundle) {
     typeof bundle.viewportHeight === "number" &&
     bundle.pageHeight <= bundle.viewportHeight + 50;
 
+  const comment = isShort
+    ? "Forsiden virker ganske enkel og litt tynn, så førsteinntrykket blir svakere enn det kunne vært."
+    : "Nettsiden fungerer, men uttrykket virker ganske enkelt og lite gjennomført visuelt.";
+
   return {
     mode: "mock",
     screenshotModeUsed: getCurrentScreenshotMode(),
     page_type: "real_site",
     confidence: 0.6,
     should_generate_comment: true,
-    score: isShort ? 5 : 6,
-    strengths: isShort
-      ? ["Siden virker enkel og oversiktlig i toppseksjonen."]
-      : ["Siden har nok innhold til å kunne vurderes visuelt."],
+    score: isShort ? 4 : 5,
+    strengths: isShort ? [] : ["Siden har nok innhold til å kunne vurderes visuelt."],
     issues: isShort
       ? ["Forsiden virker ganske kort og litt tynn visuelt."]
-      : ["Oppsett og spacing kunne vært tydeligere visuelt."],
+      : ["Oppsettet virker ganske enkelt og kunne vært tydeligere visuelt."],
     evidence: isShort
       ? ["Topputsnittet virker kort og inneholder lite variasjon."]
       : ["Det er nok innhold til å se struktur, men helheten virker enkel."],
@@ -158,11 +202,10 @@ async function analyzeWithMock(manifest, bundle) {
       placeholder_like: false,
     },
     reason_short: isShort
-      ? "The homepage is short and simple."
+      ? "The homepage is short and visually thin."
       : "The page is usable but visually basic.",
-    comment_no: isShort
-      ? "Forsiden virker ganske enkel og litt kort, så førsteinntrykket blir fort svakere enn det kunne vært."
-      : "Nettsiden har innhold nok til å fungere, men oppsett og spacing kunne vært tydeligere visuelt.",
+    comment_no: comment,
+    ai_middle: comment,
     raw_output_text: "",
     raw_analysis_json: "",
   };
@@ -367,11 +410,117 @@ function normalizeStructuredAnalysis(data) {
   if (!normalized.issues.length) {
     normalized.issues = fallback.issues;
   }
+
   if (!normalized.evidence.length) {
     normalized.evidence = [normalized.reason_short || fallback.reason_short];
   }
 
+  if (normalized.score <= 4) {
+    normalized.strengths = [];
+  }
+
   return normalized;
+}
+
+function classifyIssueFamily(text) {
+  const t = String(text || "").trim().toLowerCase();
+
+  if (
+    /gammeldags|outdated|basic|enkelt|polish|polert|gjennomført|modern|moderne|dated|visuelt svak/.test(
+      t
+    )
+  ) {
+    return "overall_style";
+  }
+
+  if (
+    /tett|dense|lite luft|hard to read|tung å lese|small text|liten tekst|brødtekst|tekstblokker|lesbar/.test(
+      t
+    )
+  ) {
+    return "text_density";
+  }
+
+  if (/button|buttons|knapp|knapper|cta/.test(t)) {
+    return "cta";
+  }
+
+  if (/footer|bunntekst/.test(t)) {
+    return "footer";
+  }
+
+  if (/image|images|photo|bilder|bilde|skewed|skrå/.test(t)) {
+    return "image";
+  }
+
+  if (/navigation|menu|meny|top line|topplinje|lenker|link row/.test(t)) {
+    return "navigation";
+  }
+
+  if (/form|skjema|contact form|kontaktfelt/.test(t)) {
+    return "form";
+  }
+
+  if (/spacing|space|luft|seksjon|section|alignment|plassering|hero/.test(t)) {
+    return "spacing_layout";
+  }
+
+  if (/font|script font|skrift/.test(t)) {
+    return "font";
+  }
+
+  return t;
+}
+
+function dedupeIssuesByFamily(issues = []) {
+  const seen = new Set();
+  const out = [];
+
+  for (const issue of issues) {
+    const value = String(issue || "").trim();
+    if (!value) continue;
+
+    const family = classifyIssueFamily(value);
+    if (seen.has(family)) continue;
+
+    seen.add(family);
+    out.push(value);
+  }
+
+  return out;
+}
+
+function compressStructuredForWriting(structured) {
+  const score = Number(structured?.score || 0);
+
+  const strengths = uniqueCaseInsensitive(structured?.strengths || []);
+  const issues = dedupeIssuesByFamily(uniqueCaseInsensitive(structured?.issues || []));
+  const evidence = uniqueCaseInsensitive(structured?.evidence || []);
+
+  let maxStrengths = 1;
+  let maxIssues = 4;
+  let maxEvidence = 6;
+
+  if (score <= 4) {
+    maxStrengths = 0;
+    maxIssues = 4;
+    maxEvidence = 6;
+  } else if (score === 5) {
+    maxStrengths = 1;
+    maxIssues = 4;
+    maxEvidence = 6;
+  } else if (score >= 8) {
+    maxStrengths = 1;
+    maxIssues = 2;
+    maxEvidence = 4;
+  }
+
+  return {
+    ...structured,
+    strengths: strengths.slice(0, maxStrengths),
+    issues: issues.slice(0, maxIssues),
+    evidence: evidence.slice(0, maxEvidence),
+  };
 }
 
 function buildLanguageAwareFallbackComment(structured, languageArg = "no") {
@@ -412,9 +561,7 @@ function buildLanguageAwareFallbackComment(structured, languageArg = "no") {
       reason ||
       "that makes the first impression feel weaker than it should";
 
-    return `the main issue is that ${first.replace(/^[A-Z]/, (m) =>
-      m.toLowerCase()
-    )}. ${second.replace(/^[a-z]/, (m) => m.toUpperCase())}.`;
+    return `${ensureSentence(upperFirst(first))} ${ensureSentence(upperFirst(second))}`;
   }
 
   const first =
@@ -424,9 +571,249 @@ function buildLanguageAwareFallbackComment(structured, languageArg = "no") {
     reason ||
     "det gjør at førsteinntrykket føles svakere enn det burde";
 
-  return `hovedproblemet er at ${first.replace(/^[A-ZÆØÅ]/, (m) =>
-    m.toLowerCase()
-  )}. ${second.replace(/^[a-zæøå]/, (m) => m.toUpperCase())}.`;
+  return `${ensureSentence(upperFirst(first))} ${ensureSentence(upperFirst(second))}`;
+}
+
+function buildDeterministicStructuredComment(structured, languageArg = "no") {
+  const isEnglish = String(languageArg || "no").toLowerCase() === "en";
+
+  if (
+    String(structured?.page_type || "") !== "real_site" ||
+    !structured?.should_generate_comment ||
+    Number(structured?.confidence || 0) < 0.55
+  ) {
+    return buildLanguageAwareFallbackComment(structured, languageArg);
+  }
+
+  const score = Number(structured?.score || 0);
+  const strengths = uniqueCaseInsensitive(structured?.strengths || []);
+  const issues = uniqueCaseInsensitive(structured?.issues || []);
+  const parts = [];
+
+  if (isEnglish) {
+    if (strengths[0] && score >= 5) {
+      parts.push(ensureSentence(upperFirst(strengths[0])));
+    }
+
+    if (issues[0]) {
+      parts.push(
+        ensureSentence(
+          strengths[0] && score >= 5
+            ? `That said, ${lowerFirst(issues[0])}`
+            : upperFirst(issues[0])
+        )
+      );
+    }
+
+    if (issues[1]) {
+      parts.push(ensureSentence(upperFirst(issues[1])));
+    }
+
+    if (issues[2] && score <= 6) {
+      parts.push(ensureSentence(upperFirst(issues[2])));
+    }
+  } else {
+    if (strengths[0] && score >= 5) {
+      parts.push(ensureSentence(upperFirst(strengths[0])));
+    }
+
+    if (issues[0]) {
+      parts.push(
+        ensureSentence(
+          strengths[0] && score >= 5
+            ? `Det er bra, men ${lowerFirst(issues[0])}`
+            : upperFirst(issues[0])
+        )
+      );
+    }
+
+    if (issues[1]) {
+      parts.push(ensureSentence(upperFirst(issues[1])));
+    }
+
+    if (issues[2] && score <= 6) {
+      parts.push(ensureSentence(upperFirst(issues[2])));
+    }
+  }
+
+  const fallback = buildLanguageAwareFallbackComment(structured, languageArg);
+  return cleanGeneratedText(parts.join(" ")) || fallback;
+}
+
+function stripLowScoreFlattery(text, structured, languageArg = "no") {
+  const score = Number(structured?.score || 0);
+  if (score > 4) return text;
+
+  const sentences = splitSentences(text);
+  if (!sentences.length) return text;
+
+  const first = String(sentences[0] || "").trim().toLowerCase();
+  const lowScorePositivePatterns = [
+    "navigasjonen er tydelig",
+    "menyen er tydelig",
+    "fargebruken",
+    "fargeskjemaet",
+    "oversiktlig",
+    "ryddig",
+    "fin sammenheng",
+    "god grunnstruktur",
+    "godt utgangspunkt",
+    "clear navigation",
+    "clear menu",
+    "consistent color",
+    "good structure",
+    "clean layout",
+    "easy to use",
+  ];
+
+  const startsTooPositive = lowScorePositivePatterns.some((p) =>
+    first.includes(p)
+  );
+
+  if (!startsTooPositive) return text;
+
+  const rest = sentences.slice(1).join(" ").trim();
+  if (rest) return rest;
+
+  return buildLanguageAwareFallbackComment(structured, languageArg);
+}
+
+function hasConcreteUiLanguage(text) {
+  const t = String(text || "").toLowerCase();
+
+  return [
+    /menu/,
+    /navigation/,
+    /top line/,
+    /topplinje/,
+    /lenker/,
+    /hero/,
+    /button|buttons|knapp|knapper|cta/,
+    /form|skjema/,
+    /footer|bunntekst/,
+    /icon|icons|ikon/,
+    /text block|text blocks|tekstblokk|tekstblokker/,
+    /font|script font|skrift/,
+    /background|bakgrunn/,
+    /spacing|luft|seksjon|section/,
+    /image|images|bilde|bilder/,
+    /headline|overskrift/,
+    /kontakt/,
+  ].some((pattern) => pattern.test(t));
+}
+
+function isTooGenericComment(text) {
+  const t = String(text || "").toLowerCase();
+
+  return [
+    "room for improvement",
+    "could be more polished",
+    "feel smoother",
+    "stronger visually",
+    "clear room to improve clarity",
+    "more refined",
+    "better presentation",
+    "mer gjennomført",
+    "mer polert",
+    "tydeligere og mer gjennomført",
+    "the site works, but there is still clear room to improve clarity",
+    "med noen få visuelle justeringer",
+    "the whole page could feel",
+  ].some((phrase) => t.includes(phrase));
+}
+
+function shouldRetrySpecificRewrite(text, structured) {
+  const cleaned = cleanGeneratedText(text);
+  if (!cleaned) return true;
+
+  const issueCount = Array.isArray(structured?.issues) ? structured.issues.length : 0;
+
+  if (issueCount >= 2 && !hasConcreteUiLanguage(cleaned)) return true;
+  if (isTooGenericComment(cleaned)) return true;
+
+  return false;
+}
+
+async function runWritingPass({
+  client,
+  model,
+  outputLanguageName,
+  prompt,
+  writingStructured,
+  strictSpecificity = false,
+}) {
+  const strictBlock = strictSpecificity
+    ? `
+
+STRICT SPECIFICITY MODE:
+- Mention 2 to 4 concrete visible observations if the structured facts support them.
+- Preserve specific page areas from the structured facts: top line navigation, menu, icon row, buttons, contact form, footer, text blocks, section spacing, images, script font, dark background, or similar.
+- Do not collapse concrete observations into vague wording like "could be more polished" or "room for improvement".
+- Do not write a bland summary.`
+    : "";
+
+  const commentResponse = await client.responses.create({
+    model,
+    temperature: strictSpecificity ? 0.3 : 0.45,
+    instructions:
+      `You are writing the final requested outreach output in ${outputLanguageName}. ` +
+      `Follow the provided style rules exactly. ` +
+      `Use only the structured analysis and evidence provided. ` +
+      `Do not invent positives. ` +
+      `If there is no clear positive, begin with a neutral factual observation instead. ` +
+      `Write like a short visual audit, not a summary of what the company offers. ` +
+      `Use simple everyday language, not designer or consultant wording. ` +
+      `Avoid generic filler like "could be more polished", "room for improvement", "feel smoother", or "stronger visually" unless you immediately tie it to a concrete visible reason. ` +
+      `Prefer specific page areas and elements when supported by the evidence: top line navigation, menu, icon row, buttons, form, footer, text blocks, images, section spacing, contact area, dark background, script font, and similar visible details. ` +
+      `A strong comment should usually contain one brief fair opening, then the clearest concrete weakness, then one or two smaller supporting visible details if available. ` +
+      `Do not flatten everything into one vague statement. ` +
+      `Do not compress concrete observations into abstract summary wording. ` +
+      `Do not mostly summarize page content. ` +
+      `Do not mention screenshots, AI, tools, browsing, or technical limitations. ` +
+      `Do not criticize the site for being in Norwegian if it clearly targets a Norwegian market. ` +
+      `When the rules say this text is inserted between an already-written intro and outro, write ONLY the middle critique section. ` +
+      `Do not greet. Do not introduce yourself. Do not say you looked at the website. Do not add a CTA. Do not add a closing line. ` +
+      `Start directly with the critique itself. ` +
+      `Return plain text only.`,
+    input: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text:
+              `WRITING STYLE RULES:\n${prompt}\n\n` +
+              `LANGUAGE REQUIRED:\n${outputLanguageName}\n\n` +
+              `STRUCTURED FACTS THAT MUST BE FOLLOWED:\n${JSON.stringify(
+                writingStructured,
+                null,
+                2
+              )}\n` +
+              strictBlock +
+              `
+
+Write the requested output now.
+Follow the WRITING STYLE RULES exactly.
+The output must be ONLY the middle critique section of an email when the rules say it is inserted between intro and outro.
+Do not restart the email.
+Do not greet.
+Do not introduce yourself.
+Do not say you looked at the website.
+Do not add a closing line or CTA.
+Start directly with the critique itself.
+It must sound concrete, believable, and based on what is actually visible.
+Use the exact structured evidence whenever possible.
+If the evidence contains several specific visible weaknesses, you may include up to three of them if the chosen writing style allows it.
+Prefer concrete details over vague wording.
+It should feel like a short critique of visual quality and clarity, not a summary of what the company offers.`,
+          },
+        ],
+      },
+    ],
+    max_output_tokens: 340,
+  });
+
+  return cleanGeneratedText(normalizeComment(extractTextFromResponse(commentResponse)));
 }
 
 // ----------------------
@@ -461,17 +848,21 @@ async function analyzeWithAI(
   const prompt =
     String(promptOverride || "").trim() ||
     (isEnglish
-      ? "Write a short, natural website outreach comment based only on what is clearly visible. Do not greet. Do not say that you looked at the site. Keep it concrete, human, and specific."
-      : "Skriv en kort og naturlig nettsidekommentar for outreach basert kun på det som er tydelig synlig. Ikke hils. Ikke skriv at du har sett på nettsiden. Hold det konkret, menneskelig og spesifikt.");
+      ? "Write only the requested outreach middle section based only on what is clearly visible. Do not greet. Do not sign off. Keep it concrete, human, and specific."
+      : "Skriv kun den ønskede midtdelen til outreach basert bare på det som er tydelig synlig. Ikke hils. Ikke signer av. Hold det konkret, menneskelig og spesifikt.");
 
   const client = new OpenAI({ apiKey });
 
   const sharedContext =
     `CONTEXT (from capture manifest):\n` +
-    `- URL: ${manifest.final_url || manifest.attempted_url || manifest.input_url || "unknown"}\n` +
+    `- URL: ${
+      manifest.final_url || manifest.attempted_url || manifest.input_url || "unknown"
+    }\n` +
     `- Title: ${manifest.homepage_title || "unknown"}\n` +
     `- Page height: ${manifest.page_height || "unknown"}\n` +
-    `- Viewport: ${manifest.viewport_desktop?.width || 1440}x${manifest.viewport_desktop?.height || 900}\n` +
+    `- Viewport: ${
+      manifest.viewport_desktop?.width || 1440
+    }x${manifest.viewport_desktop?.height || 900}\n` +
     `- Image order: ${imagePaths.length === 3 ? "TOP, MID, BOTTOM" : "TOP"}\n`;
 
   const imageContent = imagePaths.map((imgPath) => ({
@@ -494,15 +885,24 @@ async function analyzeWithAI(
       },
     },
     instructions:
-      "You are a strict website screenshot classifier. " +
+      "You are a strict but realistic website screenshot classifier. " +
       "Classify what the page actually is before any outreach writing. " +
       "Never invent strengths. Never give fake praise. " +
       "Score visual design quality, not business legitimacy or completeness. " +
-      "A site can be real, complete, and usable while still having weak or outdated visual design. " +
+      "Do not force negativity onto decent sites just to sound critical. " +
+      "If a site looks normal, usable, and fairly clean, reflect that in the score. " +
       "Do not reward a site with a high score just because it has many sections, testimonials, contact details, or a navigation menu. " +
-      "Focus strengths and issues on what is visually apparent: layout balance, spacing, hierarchy, typography, density, section clarity, CTA clarity, consistency, polish, and whether the design feels modern or dated. " +
+      "Focus on what is visually apparent: outdated look, cramped layout, dense text, weak spacing, weak button visibility, awkward image placement, heavy sections, low polish, and whether the site feels old or modern. " +
+      "Use simple everyday language in issues and evidence. Avoid design-school wording like typography, hierarchy, visual refinement, layout balance, or contrast unless absolutely necessary. " +
       "Do not mostly summarize what content exists on the page. " +
       "Do not treat local language as a weakness if the site clearly targets a local market, especially a .no site aimed at Norwegian users. " +
+      "Do not default to generic issues like small button, dense footer, low contrast, weak spacing, or heavy text unless they are clearly visible in the screenshots. " +
+      "Only include 2 to 5 issues that are actually the strongest visible weaknesses, and make them concrete rather than generic. " +
+      "Every issue should refer to a visible area or element whenever possible, such as top line navigation, menu, icon row, buttons, contact form, footer, script font, text blocks, image placement, or section spacing. " +
+      "Evidence should sound like direct visual observation, not design advice. " +
+      "For scores 0-4, strengths should usually be empty unless something genuinely stands out. " +
+      "For score 5, at most one small positive is allowed if it is clearly visible. " +
+      "For score 6, allow a mixed view: decent but not polished. " +
       "If the screenshots look blank, broken, parked, placeholder-like, under construction, or too thin to judge safely, set should_generate_comment=false.",
     input: [
       {
@@ -517,15 +917,19 @@ async function analyzeWithAI(
               `2. Decide whether it is appropriate to generate a normal website comment.\n` +
               `3. Include strengths only if they are truly visible and visually meaningful.\n` +
               `4. Evidence must be concrete observations from the screenshots, not generic advice.\n` +
-              `5. Separate website completeness from visual design quality.\n\n` +
+              `5. Separate website completeness from visual design quality.\n` +
+              `6. Do not repeat generic critique patterns unless they are clearly supported by the screenshots.\n\n` +
               `Important:\n` +
               `- Use "real_site" only when this clearly looks like an actual business website with enough content to judge.\n` +
               `- If the page looks blank, temporary, parked, broken, placeholder-like, or very thin, set should_generate_comment=false.\n` +
               `- Score means visual design quality only.\n` +
               `- A real business website can still score low if it looks outdated, basic, heavy, cramped, messy, or visually weak.\n` +
+              `- A normal usable SMB site often belongs around 5-6, not automatically 3-4.\n` +
               `- Do not use “the site is in Norwegian” as an issue for a Norwegian local business site.\n` +
-              `- Prefer issues about outdated styling, heavy sections, weak spacing, weak hierarchy, dense text, uneven balance, basic typography, or low visual polish.\n` +
-              `- Do not write outreach text yet. Return classification data only.\n`,
+              `- Prefer simple issue wording like gammeldags, enkelt, tett, tung å lese, lite luft, svak knapp, bildet sitter ikke helt, mindre ryddig, mindre gjennomført.\n` +
+              `- Do not write outreach text yet. Return classification data only.\n` +
+              `- When possible, evidence should name the visible area directly, such as top line navigation, icon row, buttons, footer, contact form, text blocks, background, script font, image placement, or section spacing.\n` +
+              `- At least one issue should name a concrete visible element or area when confidence is high enough.\n`,
           },
           ...imageContent,
         ],
@@ -544,6 +948,8 @@ async function analyzeWithAI(
         "Could not parse structured analysis JSON"
       )
   );
+
+  const writingStructured = compressStructuredForWriting(structured);
 
   if (
     structured.page_type !== "real_site" ||
@@ -569,6 +975,7 @@ async function analyzeWithAI(
       visible_signals: structured.visible_signals,
       reason_short: structured.reason_short,
       comment_no: fallbackComment,
+      ai_middle: fallbackComment,
       raw_output_text: fallbackComment,
       raw_analysis_json: rawStructuredText,
     };
@@ -577,58 +984,37 @@ async function analyzeWithAI(
   // -----------------------
   // STAGE 2: FINAL WRITING
   // -----------------------
-  const commentResponse = await client.responses.create({
+  let rawText = await runWritingPass({
+    client,
     model,
-    temperature: 0.3,
-    instructions:
-      `You are writing the final visible outreach text in ${outputLanguageName}. ` +
-      `Follow the provided style rules exactly. ` +
-      `Use only the structured analysis provided. ` +
-      `Do not invent positives. ` +
-      `If there is no clear positive, begin with a neutral factual observation instead. ` +
-      `Write like a short visual audit, not a summary of page contents. ` +
-      `At most one short positive observation is allowed, then move quickly to the main weakness. ` +
-      `Focus more on what feels outdated, heavy, basic, cramped, visually weak, or less polished. ` +
-      `Do not mostly describe products, features, sections, or company claims. ` +
-      `Do not criticize the site for being in Norwegian if it clearly targets a Norwegian market. ` +
-      `Do not greet. ` +
-      `Do not repeat any email intro unless the style rules explicitly require it. ` +
-      `Do not mention screenshots, AI, tools, browsing, or technical limitations. ` +
-      `Return plain text only.`,
-    input: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "input_text",
-            text:
-              `WRITING STYLE RULES:\n${prompt}\n\n` +
-              `LANGUAGE REQUIRED:\n${outputLanguageName}\n\n` +
-              `STRUCTURED FACTS THAT MUST BE FOLLOWED:\n${JSON.stringify(
-                structured,
-                null,
-                2
-              )}\n\n` +
-              `Write the final visible outreach text now. ` +
-              `It must sound concrete, believable, and based on what is actually visible. ` +
-              `It should feel like a short critique of visual quality and clarity, not a summary of what the company offers.`,
-          },
-        ],
-      },
-    ],
-    max_output_tokens: 260,
+    outputLanguageName,
+    prompt,
+    writingStructured,
+    strictSpecificity: false,
   });
 
-  let rawText = normalizeComment(extractTextFromResponse(commentResponse));
+  if (shouldRetrySpecificRewrite(rawText, writingStructured)) {
+    rawText = await runWritingPass({
+      client,
+      model,
+      outputLanguageName,
+      prompt,
+      writingStructured,
+      strictSpecificity: true,
+    });
+  }
+
   rawText = cleanGeneratedText(rawText);
 
-  if (!rawText) {
-    rawText = buildLanguageAwareFallbackComment(structured, languageArg);
+  if (!rawText || shouldRetrySpecificRewrite(rawText, writingStructured)) {
+    rawText = buildDeterministicStructuredComment(writingStructured, languageArg);
   }
+
+  rawText = stripLowScoreFlattery(rawText, writingStructured, languageArg);
 
   const cleaned =
     cleanGeneratedText(rawText) ||
-    buildLanguageAwareFallbackComment(structured, languageArg);
+    buildLanguageAwareFallbackComment(writingStructured, languageArg);
 
   return {
     mode: "openai",
@@ -644,6 +1030,7 @@ async function analyzeWithAI(
     visible_signals: structured.visible_signals,
     reason_short: structured.reason_short,
     comment_no: cleaned,
+    ai_middle: cleaned,
     raw_output_text: rawText,
     raw_analysis_json: rawStructuredText,
   };
@@ -693,7 +1080,9 @@ async function runAnalysis(
     analysis,
   };
 
-  const base = safeFileName(manifest.input_url || manifest.final_url || "unknown");
+  const base = safeFileName(
+    manifest.input_url || manifest.final_url || "unknown"
+  );
   const outPath = path.join(ANALYSIS_RESULTS_DIR, `${base}.analysis.json`);
   writeJson(outPath, result);
 
@@ -703,7 +1092,11 @@ async function runAnalysis(
 /* ======================
    STAGE 1: SCORE-ONLY
 ====================== */
-async function runScoreOnlyAnalysis(input, languageArg = "no", engineArg = "openai") {
+async function runScoreOnlyAnalysis(
+  input,
+  languageArg = "no",
+  engineArg = "openai"
+) {
   const manifestPath = getManifestPath(input);
 
   if (!fs.existsSync(manifestPath)) {
@@ -731,7 +1124,7 @@ async function runScoreOnlyAnalysis(input, languageArg = "no", engineArg = "open
   let imagePaths = [];
   try {
     imagePaths = getImagePathsForMode(manifest);
-  } catch (err) {
+  } catch (_) {
     return {
       reachable: false,
       score: 0,
@@ -775,17 +1168,20 @@ async function runScoreOnlyAnalysis(input, languageArg = "no", engineArg = "open
               "Quickly qualify this website based only on the visible screenshots.\n\n" +
               "IMPORTANT:\n" +
               "- Score ONLY visual design quality.\n" +
+              "- Be realistic and moderately strict, but do not force weak scores on decent normal business websites.\n" +
+              "- If a site looks usable, structured, and fairly clean, it often belongs around 5-6 even if it is not modern.\n" +
+              "- Use lower scores only when the site clearly looks rough, messy, broken-looking, very outdated, or very weak visually.\n" +
               "- Do NOT reward the site just because it is real, complete, trustworthy, or has a lot of information.\n" +
-              "- A real business website can still have weak visual design.\n" +
               "- Do NOT use these as reasons for a high score by themselves: menu exists, testimonials exist, contact info exists, many sections exist, business looks legitimate.\n" +
-              "- Focus on how modern or outdated it looks, visual polish, spacing, typography, layout balance, hierarchy, consistency, density, clarity of sections, and overall first impression.\n" +
-              "- Do NOT treat Norwegian language on a .no / Norwegian local business site as a design weakness.\n\n" +
-              "Use this strict scale:\n" +
+              "- Focus on how modern or outdated it looks, visual polish, spacing, text density, clarity, balance, button visibility, image placement, and overall first impression.\n" +
+              "- Do NOT treat Norwegian language on a .no / Norwegian local business site as a weakness.\n\n" +
+              "Use this scale:\n" +
               "0 = not a real usable website / unreachable / broken / parked / placeholder\n" +
-              "1-2 = broken-looking, extremely outdated, or very poor visual quality\n" +
-              "3-4 = weak / clearly outdated visual design\n" +
-              "5-6 = acceptable but basic, mixed, or only somewhat polished\n" +
-              "7-8 = strong and polished visual design\n" +
+              "1-2 = extremely poor, broken-looking, or almost unusable visually\n" +
+              "3-4 = clearly weak, rough, or obviously outdated visual quality\n" +
+              "5 = usable but basic, dated, or somewhat weak visually\n" +
+              "6 = decent and fairly solid, but not polished or modern\n" +
+              "7-8 = strong, clean, and clearly above average visual quality\n" +
               "9-10 = excellent, modern, highly polished visual design\n\n" +
               "If it looks like a 404 page, browser error, forbidden page, parked domain, domain for sale page, blank page, coming soon page, maintenance page, or otherwise not like a real usable website, set reachable=false, score=0, and page_type to one of: unreachable, broken_page, parking_page, placeholder_page, under_construction.\n\n" +
               "If it looks like a real website, set page_type=real_site.\n" +
@@ -812,7 +1208,9 @@ async function runScoreOnlyAnalysis(input, languageArg = "no", engineArg = "open
       score: Math.max(0, Math.min(10, Number(parsed.score) || 0)),
       severity: String(parsed.severity || "medium"),
       reason: String(parsed.reason || ""),
-      page_type: String(parsed.page_type || (parsed.reachable ? "real_site" : "unreachable")),
+      page_type: String(
+        parsed.page_type || (parsed.reachable ? "real_site" : "unreachable")
+      ),
     };
   } catch {
     return {
