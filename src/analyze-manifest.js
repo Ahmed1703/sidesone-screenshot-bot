@@ -114,6 +114,81 @@ function splitSentences(text) {
     .filter(Boolean);
 }
 
+function detectLikelyLanguage(text) {
+  const value = String(text || "").toLowerCase();
+
+  const norwegianSignals = [
+    " og ",
+    " det ",
+    " ikke ",
+    "nettsiden",
+    "kunne",
+    "også",
+    "føles",
+    "inntrykk",
+    "struktur",
+    "kontakt",
+    "lese",
+    "siden",
+    "tydelig",
+    "seksjon",
+    "overskrift",
+    "bakgrunn",
+    "knapp",
+    "skjema",
+    "luft",
+  ];
+
+  const englishSignals = [
+    " the ",
+    " and ",
+    " could ",
+    " feels ",
+    " overall ",
+    " site ",
+    " contact ",
+    " section ",
+    " clear ",
+    " layout ",
+    " readability ",
+    " headline ",
+    " background ",
+    " button ",
+    " form ",
+    " spacing ",
+  ];
+
+  const noScore = norwegianSignals.reduce(
+    (sum, token) => sum + (value.includes(token) ? 1 : 0),
+    0
+  );
+
+  const enScore = englishSignals.reduce(
+    (sum, token) => sum + (value.includes(token) ? 1 : 0),
+    0
+  );
+
+  if (noScore >= 2 && noScore > enScore) return "norwegian";
+  if (enScore >= 2 && enScore > noScore) return "english";
+  return "unknown";
+}
+
+function isWrongLanguage(text, languageArg = "no") {
+  const detected = detectLikelyLanguage(text);
+  const wantsEnglish = String(languageArg || "no").toLowerCase() === "en";
+
+  if (detected === "unknown") return false;
+  if (wantsEnglish) return detected !== "english";
+  return detected !== "norwegian";
+}
+
+function getLanguageSafeText(text, languageArg = "no") {
+  const value = String(text || "").trim();
+  if (!value) return "";
+  if (isWrongLanguage(value, languageArg)) return "";
+  return value;
+}
+
 function ensureSentence(text) {
   const value = String(text || "").trim();
   if (!value) return "";
@@ -202,8 +277,8 @@ async function analyzeWithMock(manifest, bundle) {
       placeholder_like: false,
     },
     reason_short: isShort
-      ? "The homepage is short and visually thin."
-      : "The page is usable but visually basic.",
+      ? "Forsiden virker kort og visuelt tynn."
+      : "Siden er brukbar, men visuelt ganske enkel.",
     comment_no: comment,
     ai_middle: comment,
     raw_output_text: "",
@@ -339,16 +414,34 @@ const PAGE_ANALYSIS_SCHEMA = {
   ],
 };
 
-function buildFallbackStructuredAnalysis(reason) {
+function buildFallbackStructuredAnalysis(reason, languageArg = "no") {
+  const isEnglish = String(languageArg || "no").toLowerCase() === "en";
+
   return {
     page_type: "unclear",
     confidence: 0.2,
     should_generate_comment: false,
     score: 0,
     strengths: [],
-    issues: ["The page could not be classified safely."],
-    evidence: [String(reason || "Could not classify page safely.")],
-    reason_short: String(reason || "Could not classify page safely."),
+    issues: [
+      isEnglish
+        ? "The page could not be classified safely."
+        : "Siden kunne ikke klassifiseres trygt.",
+    ],
+    evidence: [
+      String(
+        reason ||
+          (isEnglish
+            ? "Could not classify page safely."
+            : "Kunne ikke klassifisere siden trygt.")
+      ),
+    ],
+    reason_short: String(
+      reason ||
+        (isEnglish
+          ? "Could not classify page safely."
+          : "Kunne ikke klassifisere siden trygt.")
+    ),
     visible_signals: {
       has_nav: false,
       has_headline: false,
@@ -362,9 +455,10 @@ function buildFallbackStructuredAnalysis(reason) {
   };
 }
 
-function normalizeStructuredAnalysis(data) {
+function normalizeStructuredAnalysis(data, languageArg = "no") {
   const fallback = buildFallbackStructuredAnalysis(
-    "Could not normalize structured analysis"
+    "Could not normalize structured analysis",
+    languageArg
   );
 
   const normalized = {
@@ -527,13 +621,15 @@ function buildLanguageAwareFallbackComment(structured, languageArg = "no") {
   const isEnglish = String(languageArg || "no").toLowerCase() === "en";
 
   const pageType = String(structured?.page_type || "unclear");
-  const issue1 = String(structured?.issues?.[0] || "").trim();
-  const issue2 = String(
-    structured?.issues?.[1] || structured?.evidence?.[0] || ""
-  ).trim();
-  const reason = String(
-    structured?.reason_short || structured?.evidence?.[0] || ""
-  ).trim();
+  const issue1 = getLanguageSafeText(structured?.issues?.[0] || "", languageArg);
+  const issue2 = getLanguageSafeText(
+    structured?.issues?.[1] || structured?.evidence?.[0] || "",
+    languageArg
+  );
+  const reason = getLanguageSafeText(
+    structured?.reason_short || structured?.evidence?.[0] || "",
+    languageArg
+  );
 
   if (
     pageType !== "real_site" ||
@@ -542,36 +638,40 @@ function buildLanguageAwareFallbackComment(structured, languageArg = "no") {
   ) {
     if (isEnglish) {
       return (
-        "this does not look like a normal finished business website in the screenshots, " +
+        "This does not look like a normal finished business website in the screenshots, " +
         "so it would be misleading to write a standard website critique here."
       );
     }
 
     return (
-      "dette ser ikke ut som en vanlig ferdig bedriftsnettside i skjermbildene, " +
+      "Dette ser ikke ut som en vanlig ferdig bedriftsnettside i skjermbildene, " +
       "så det blir misvisende å skrive en vanlig nettsidekommentar her."
     );
   }
 
   if (isEnglish) {
     const first =
-      issue1 || "the page structure and clarity are weaker than they should be";
+      issue1 || "The page structure and clarity are weaker than they should be";
     const second =
       issue2 ||
       reason ||
-      "that makes the first impression feel weaker than it should";
+      "That makes the first impression feel weaker than it should";
 
-    return `${ensureSentence(upperFirst(first))} ${ensureSentence(upperFirst(second))}`;
+    return `${ensureSentence(upperFirst(first))} ${ensureSentence(
+      upperFirst(second)
+    )}`;
   }
 
   const first =
-    issue1 || "strukturen og tydeligheten på siden er svakere enn den burde være";
+    issue1 || "Strukturen og tydeligheten på siden er svakere enn den burde være";
   const second =
     issue2 ||
     reason ||
-    "det gjør at førsteinntrykket føles svakere enn det burde";
+    "Det gjør at førsteinntrykket føles svakere enn det burde";
 
-  return `${ensureSentence(upperFirst(first))} ${ensureSentence(upperFirst(second))}`;
+  return `${ensureSentence(upperFirst(first))} ${ensureSentence(
+    upperFirst(second)
+  )}`;
 }
 
 function buildDeterministicStructuredComment(structured, languageArg = "no") {
@@ -586,8 +686,14 @@ function buildDeterministicStructuredComment(structured, languageArg = "no") {
   }
 
   const score = Number(structured?.score || 0);
-  const strengths = uniqueCaseInsensitive(structured?.strengths || []);
-  const issues = uniqueCaseInsensitive(structured?.issues || []);
+  const strengths = uniqueCaseInsensitive(
+    (structured?.strengths || []).map((x) => getLanguageSafeText(x, languageArg))
+  ).filter(Boolean);
+
+  const issues = uniqueCaseInsensitive(
+    (structured?.issues || []).map((x) => getLanguageSafeText(x, languageArg))
+  ).filter(Boolean);
+
   const parts = [];
 
   if (isEnglish) {
@@ -757,6 +863,11 @@ STRICT SPECIFICITY MODE:
     temperature: strictSpecificity ? 0.3 : 0.45,
     instructions:
       `You are writing the final requested outreach output in ${outputLanguageName}. ` +
+      `Every sentence must be written only in ${outputLanguageName}. ` +
+      `Never mix languages. ` +
+      `If the structured facts contain text in another language, translate them before writing. ` +
+      `Do not copy English phrases into Norwegian output. ` +
+      `Do not copy Norwegian phrases into English output. ` +
       `Follow the provided style rules exactly. ` +
       `Use only the structured analysis and evidence provided. ` +
       `Do not invent positives. ` +
@@ -805,7 +916,9 @@ It must sound concrete, believable, and based on what is actually visible.
 Use the exact structured evidence whenever possible.
 If the evidence contains several specific visible weaknesses, you may include up to three of them if the chosen writing style allows it.
 Prefer concrete details over vague wording.
-It should feel like a short critique of visual quality and clarity, not a summary of what the company offers.`,
+It should feel like a short critique of visual quality and clarity, not a summary of what the company offers.
+Write the full output only in ${outputLanguageName}.
+Never mix languages.`,
           },
         ],
       },
@@ -886,6 +999,11 @@ async function analyzeWithAI(
     },
     instructions:
       "You are a strict but realistic website screenshot classifier. " +
+      `All free-text fields in the JSON must be written in ${outputLanguageName}. ` +
+      `That includes strengths, issues, evidence, and reason_short. ` +
+      `Never mix languages in those fields. ` +
+      `If ${outputLanguageName} is Norwegian Bokmål, do not write English in any free-text field. ` +
+      `If ${outputLanguageName} is English, do not write Norwegian in any free-text field. ` +
       "Classify what the page actually is before any outreach writing. " +
       "Never invent strengths. Never give fake praise. " +
       "Score visual design quality, not business legitimacy or completeness. " +
@@ -920,6 +1038,8 @@ async function analyzeWithAI(
               `5. Separate website completeness from visual design quality.\n` +
               `6. Do not repeat generic critique patterns unless they are clearly supported by the screenshots.\n\n` +
               `Important:\n` +
+              `- All free-text values in the JSON must be written in ${outputLanguageName}.\n` +
+              `- Never mix English and Norwegian in strengths, issues, evidence, or reason_short.\n` +
               `- Use "real_site" only when this clearly looks like an actual business website with enough content to judge.\n` +
               `- If the page looks blank, temporary, parked, broken, placeholder-like, or very thin, set should_generate_comment=false.\n` +
               `- Score means visual design quality only.\n` +
@@ -945,8 +1065,10 @@ async function analyzeWithAI(
   const structured = normalizeStructuredAnalysis(
     parsedStructured ||
       buildFallbackStructuredAnalysis(
-        "Could not parse structured analysis JSON"
-      )
+        "Could not parse structured analysis JSON",
+        languageArg
+      ),
+    languageArg
   );
 
   const writingStructured = compressStructuredForWriting(structured);
@@ -993,7 +1115,13 @@ async function analyzeWithAI(
     strictSpecificity: false,
   });
 
-  if (shouldRetrySpecificRewrite(rawText, writingStructured)) {
+  rawText = cleanGeneratedText(rawText);
+
+  if (
+    !rawText ||
+    shouldRetrySpecificRewrite(rawText, writingStructured) ||
+    isWrongLanguage(rawText, languageArg)
+  ) {
     rawText = await runWritingPass({
       client,
       model,
@@ -1002,15 +1130,23 @@ async function analyzeWithAI(
       writingStructured,
       strictSpecificity: true,
     });
+
+    rawText = cleanGeneratedText(rawText);
   }
 
-  rawText = cleanGeneratedText(rawText);
-
-  if (!rawText || shouldRetrySpecificRewrite(rawText, writingStructured)) {
+  if (
+    !rawText ||
+    shouldRetrySpecificRewrite(rawText, writingStructured) ||
+    isWrongLanguage(rawText, languageArg)
+  ) {
     rawText = buildDeterministicStructuredComment(writingStructured, languageArg);
   }
 
   rawText = stripLowScoreFlattery(rawText, writingStructured, languageArg);
+
+  if (isWrongLanguage(rawText, languageArg)) {
+    rawText = buildDeterministicStructuredComment(writingStructured, languageArg);
+  }
 
   const cleaned =
     cleanGeneratedText(rawText) ||
