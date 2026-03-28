@@ -3,12 +3,118 @@ require("dotenv").config();
 const { Redis } = require("@upstash/redis");
 const redis = Redis.fromEnv();
 
+const pullCsvRows = require("./pull-csv-rows");
 const pullSheetUrls = require("./pull-sheet-urls");
 const pushSheetResult = require("./push-sheet-results");
 const { deleteSheetRow } = pushSheetResult;
 const { runAnalysis, runScoreOnlyAnalysis } = require("./analyze-manifest");
 const { captureWebsite } = require("./capture");
 const { buildAnalyzerPrompt } = require("./analyzer-prompt");
+
+const APP_BASE_URL = String(process.env.APP_BASE_URL || "").replace(/\/+$/, "");
+const INTERNAL_WORKER_SECRET = String(process.env.INTERNAL_WORKER_SECRET || "");
+
+function normalizeUrlForCreditKey(url) {
+  return String(url || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/+$/, "");
+}
+
+function isChargeableOutcome(status) {
+  return (
+    status === "success" ||
+    status === "skipped" ||
+    status === "good_site" ||
+    status === "cleared"
+  );
+}
+
+async function consumeAnalysisCredit({
+  appUserId,
+  jobId,
+  siteUrl,
+  rowNumber = null,
+  status,
+  score = null,
+  pageType = null,
+}) {
+  if (!isChargeableOutcome(status)) {
+    return { charged: false };
+  }
+
+  if (!appUserId) {
+    throw new Error("Missing appUserId for credit deduction.");
+  }
+
+  if (!APP_BASE_URL || !INTERNAL_WORKER_SECRET) {
+    throw new Error("Missing APP_BASE_URL or INTERNAL_WORKER_SECRET.");
+  }
+
+  const referenceKey =
+    rowNumber === null
+      ? `analysis:${jobId}:single`
+      : `analysis:${jobId}:row:${rowNumber}:${normalizeUrlForCreditKey(siteUrl)}`;
+
+  const res = await fetch(`${APP_BASE_URL}/api/internal/consume-credit`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-internal-worker-secret": INTERNAL_WORKER_SECRET,
+    },
+    body: JSON.stringify({
+      userId: String(appUserId),
+      amount: 1,
+      referenceKey,
+      reason: "Website analysis completed",
+      metadata: {
+        jobId,
+        rowNumber,
+        siteUrl,
+        status,
+        score,
+        pageType,
+      },
+    }),
+  });
+
+  const data = await res.json().catch(() => null);
+
+  if (!res.ok) {
+    throw new Error(data?.error || "Credit deduction failed.");
+  }
+
+  return {
+    charged: true,
+    data,
+  };
+}
+
+/* =========================
+   TIMEOUT / RETRY CONFIG
+========================== */
+
+const STEP_TIMEOUTS = {
+  pullRowsMs: Number(process.env.WORKER_PULL_ROWS_TIMEOUT_MS) || 45000,
+  captureMs: Number(process.env.WORKER_CAPTURE_TIMEOUT_MS) || 45000,
+  scoreMs: Number(process.env.WORKER_SCORE_TIMEOUT_MS) || 45000,
+  analysisMs: Number(process.env.WORKER_ANALYSIS_TIMEOUT_MS) || 70000,
+  writeSheetMs: Number(process.env.WORKER_WRITE_SHEET_TIMEOUT_MS) || 20000,
+  deleteRowMs: Number(process.env.WORKER_DELETE_ROW_TIMEOUT_MS) || 20000,
+};
+
+const STEP_RETRIES = {
+  pullRows: Number(process.env.WORKER_PULL_ROWS_RETRIES) || 1,
+  capture: Number(process.env.WORKER_CAPTURE_RETRIES) || 2,
+  score: Number(process.env.WORKER_SCORE_RETRIES) || 2,
+  analysis: Number(process.env.WORKER_ANALYSIS_RETRIES) || 2,
+  writeSheet: Number(process.env.WORKER_WRITE_SHEET_RETRIES) || 2,
+  deleteRow: Number(process.env.WORKER_DELETE_ROW_RETRIES) || 2,
+};
+
+const STEP_RETRY_DELAY_MS =
+  Number(process.env.WORKER_RETRY_DELAY_MS) || 1200;
 
 /* =========================
    HELPERS
@@ -76,7 +182,15 @@ function normalizeLanguage(value) {
   const v = String(value || "").trim().toLowerCase();
 
   if (v === "en" || v === "english") return "en";
-  if (v === "no" || v === "norwegian" || v === "bokmal" || v === "bokmål") {
+  if (
+    v === "no" ||
+    v === "norwegian" ||
+    v === "bokmal" ||
+    v === "bokmål" ||
+    v === "norsk" ||
+    v === "nb" ||
+    v === "nn"
+  ) {
     return "no";
   }
 
@@ -112,6 +226,98 @@ function normalizeOutputLength(value) {
 
 function safeString(value, max = 5000) {
   return String(value || "").slice(0, max);
+}
+
+function safeErrorMessage(err, fallback = "Unknown error") {
+  if (!err) return fallback;
+
+  if (typeof err === "string") {
+    return err.slice(0, 500);
+  }
+
+  if (err instanceof Error) {
+    return String(err.message || fallback).slice(0, 500);
+  }
+
+  return String(err?.message || err || fallback).slice(0, 500);
+}
+
+function createTimeoutError(label, ms) {
+  const err = new Error(`${label} timed out after ${ms}ms`);
+  err.code = "STEP_TIMEOUT";
+  err.stepLabel = label;
+  err.timeoutMs = ms;
+  return err;
+}
+
+function withTimeout(work, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(createTimeoutError(label, ms));
+    }, ms);
+
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+
+    Promise.resolve()
+      .then(() => (typeof work === "function" ? work() : work))
+      .then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        }
+      );
+  });
+}
+
+async function runWithRetry({
+  label,
+  timeoutMs,
+  attempts = 1,
+  retryDelayMs = STEP_RETRY_DELAY_MS,
+  fn,
+}) {
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await withTimeout(() => fn(attempt), timeoutMs, label);
+    } catch (err) {
+      lastErr = err;
+      console.warn(
+        `[${label}] attempt ${attempt}/${attempts} failed:`,
+        safeErrorMessage(err)
+      );
+
+      if (attempt < attempts) {
+        await sleep(retryDelayMs * attempt);
+      }
+    }
+  }
+
+  throw lastErr;
+}
+
+function buildBatchResultPayload(row, payload = {}) {
+  return {
+    url: row?.url || "",
+    recipientEmail:
+      row?.recipientEmail ||
+      row?.email ||
+      row?.mail ||
+      row?.contactEmail ||
+      "",
+    firstName: row?.firstName || row?.first_name || "",
+    companyName: row?.companyName || row?.company_name || "",
+    industry: row?.industry || "",
+    location: row?.location || "",
+    ...payload,
+  };
 }
 
 function normalizePageType(value) {
@@ -412,6 +618,33 @@ function finalizeGeneratedComment(analysisResult, writing, language) {
   return getDefaultFallbackComment(language);
 }
 
+function buildStoredAnalysisPayload(analysisResult) {
+  const analysis = analysisResult?.analysis || {};
+
+  return {
+    mode: analysis.mode || null,
+    model: analysis.model || null,
+    screenshotModeUsed: analysis.screenshotModeUsed || null,
+    page_type: analysis.page_type || null,
+    confidence:
+      typeof analysis.confidence === "number" ? analysis.confidence : null,
+    should_generate_comment:
+      typeof analysis.should_generate_comment === "boolean"
+        ? analysis.should_generate_comment
+        : null,
+    score: typeof analysis.score === "number" ? analysis.score : null,
+    strengths: Array.isArray(analysis.strengths) ? analysis.strengths : [],
+    issues: Array.isArray(analysis.issues) ? analysis.issues : [],
+    evidence: Array.isArray(analysis.evidence) ? analysis.evidence : [],
+    visible_signals: analysis.visible_signals || null,
+    reason_short: analysis.reason_short || "",
+    raw_analysis_json: analysis.raw_analysis_json || "",
+    raw_output_text: analysis.raw_output_text || "",
+    ai_middle: analysis.ai_middle || "",
+    comment_no: analysis.comment_no || "",
+  };
+}
+
 function getDefaultSystemConfig() {
   return {
     analysis: {
@@ -532,8 +765,29 @@ function applyScreenshotEnv(mode) {
   process.env.SIDESONE_SCREENSHOT_MODE = mode;
 }
 
+function clearLiveStep(meta) {
+  meta.currentStep = null;
+  meta.currentStepLabel = null;
+  meta.currentUrl = null;
+  meta.currentRowIndex = null;
+  meta.currentAttempt = null;
+  meta.stepStartedAt = null;
+}
+
+function isCsvBatch(meta) {
+  if (String(meta?.sourceType || "").toLowerCase() === "csv") return true;
+  return !!meta?.csvRawText;
+}
+
+function isSheetBatch(meta) {
+  if (String(meta?.sourceType || "").toLowerCase() === "google") return true;
+  if (!meta?.sourceType && meta?.sheetId) return true;
+  return !isCsvBatch(meta) && !!meta?.sheetId;
+}
+
 async function persistMeta(jobId, meta) {
   meta.updatedAt = nowIso();
+  meta.lastHeartbeatAt = nowIso();
   await redis.set(`job:${jobId}:meta`, meta);
 }
 
@@ -541,11 +795,76 @@ async function persistProgressMeta(jobId, meta) {
   const current = await redis.get(`job:${jobId}:meta`);
 
   meta.updatedAt = nowIso();
+  meta.lastHeartbeatAt = nowIso();
 
   await redis.set(`job:${jobId}:meta`, {
     ...meta,
     status: current?.status || meta.status,
   });
+}
+
+async function markStep(jobId, meta, step, label, extras = {}) {
+  meta.currentStep = step;
+  meta.currentStepLabel = label;
+  meta.currentUrl = extras.url || null;
+  meta.currentRowIndex =
+    Number.isFinite(extras.rowIndex) ? extras.rowIndex : null;
+  meta.currentAttempt = extras.attempt || 1;
+  meta.stepStartedAt = nowIso();
+  meta.lastStepError = null;
+  await persistMeta(jobId, meta);
+}
+
+async function runStep(jobId, meta, options) {
+  const {
+    step,
+    label,
+    timeoutMs,
+    attempts = 1,
+    url = null,
+    rowIndex = null,
+    fn,
+  } = options;
+
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    await markStep(jobId, meta, step, label, {
+      url,
+      rowIndex,
+      attempt,
+    });
+
+    try {
+      const result = await withTimeout(
+        () => fn(attempt),
+        timeoutMs,
+        `${label}${url ? ` (${url})` : ""}`
+      );
+
+      meta.lastSuccessfulStep = step;
+      meta.lastStepError = null;
+      await persistMeta(jobId, meta);
+
+      return result;
+    } catch (err) {
+      lastErr = err;
+      meta.lastStepError = safeErrorMessage(err);
+      await persistMeta(jobId, meta);
+
+      console.warn(
+        `[${label}] attempt ${attempt}/${attempts} failed:`,
+        url || "",
+        safeErrorMessage(err)
+      );
+
+      if (attempt < attempts) {
+        await sleep(STEP_RETRY_DELAY_MS * attempt);
+      }
+    }
+  }
+
+  throw lastErr;
 }
 
 async function pushRedisResult(jobId, payload) {
@@ -565,13 +884,51 @@ function createMetaWriteQueue(jobId, meta) {
 }
 
 async function writeSheet(meta, row, text) {
-  await pushSheetResult({
-    userId: meta.userId,
-    sheetId: meta.sheetId,
-    sheetTab: meta.sheetTab,
-    rowIndex: row.rowIndex,
-    comment: text,
-    column: meta.outputColumn || "O",
+  const shouldWriteBackToSheet = meta?.sourceType !== "google";
+
+  if (shouldWriteBackToSheet) {
+    try {
+      await runWithRetry({
+        label: `writeSheet row ${row.rowIndex}`,
+        timeoutMs: STEP_TIMEOUTS.writeSheetMs,
+        attempts: STEP_RETRIES.writeSheet,
+        fn: () =>
+          pushSheetResult({
+            userId: meta.userId,
+            sheetId: meta.sheetId,
+            sheetTab: meta.sheetTab,
+            rowIndex: row.rowIndex,
+            comment: text,
+            column: meta.outputColumn || "O",
+          }),
+      });
+    } catch (err) {
+      console.error("[writeSheet non-fatal]", err);
+    }
+  } else {
+    console.log(
+      "[writeSheet skipped] Google Sheets source now behaves like CSV batch."
+    );
+  }
+}
+
+async function maybeWriteSheet(meta, row, text) {
+  if (!isSheetBatch(meta)) return;
+  return writeSheet(meta, row, text);
+}
+
+async function safeDeleteSheetRow(meta, rowIndex) {
+  return runWithRetry({
+    label: `deleteSheetRow row ${rowIndex}`,
+    timeoutMs: STEP_TIMEOUTS.deleteRowMs,
+    attempts: STEP_RETRIES.deleteRow,
+    fn: () =>
+      deleteSheetRow({
+        userId: meta.userId,
+        sheetId: meta.sheetId,
+        sheetTab: meta.sheetTab,
+        rowIndex,
+      }),
   });
 }
 
@@ -685,6 +1042,31 @@ function buildPromptOverrideFromWriting(basePrompt, writing) {
     .join("\n");
 }
 
+function getUnreachableOutcome(cfg, analysisLanguage) {
+  if (cfg.unreachableAction === "fallback") {
+    return {
+      out: cfg.fallbackPrompt || getDefaultFallbackComment(analysisLanguage),
+      status: "fallback",
+      sheetValue:
+        cfg.fallbackPrompt || getDefaultFallbackComment(analysisLanguage),
+    };
+  }
+
+  if (cfg.unreachableAction === "tag") {
+    return {
+      out: "UNREACHABLE",
+      status: "unreachable",
+      sheetValue: "UNREACHABLE",
+    };
+  }
+
+  return {
+    out: "UNREACHABLE (skipped)",
+    status: "unreachable",
+    sheetValue: "",
+  };
+}
+
 /* =========================
    PROCESS JOB
 ========================== */
@@ -696,6 +1078,16 @@ async function processJob(jobId) {
   console.log("JOB META RECEIVED:", meta);
 
   if (!meta) return;
+
+  console.log("CSV META DEBUG:", {
+    sourceType: meta?.sourceType,
+    csvFileName: meta?.csvFileName,
+    csvUrlColumn: meta?.csvUrlColumn,
+    csvMailColumn: meta?.csvMailColumn,
+    hasCsvRawText: !!meta?.csvRawText,
+    fallbackUrlColumn: meta?.urlColumn,
+    fallbackMailColumn: meta?.mailColumn,
+  });
 
   const systemConfig = await loadSystemConfig();
   const cfg = getAnalysisConfig(meta, systemConfig);
@@ -710,7 +1102,10 @@ async function processJob(jobId) {
   meta.analyzed = 0;
   meta.failed = 0;
   meta.updatedAt = nowIso();
+  meta.startedAt = meta.startedAt || nowIso();
   meta.error = null;
+  meta.lastStepError = null;
+  clearLiveStep(meta);
 
   await redis.del(`job:${jobId}:results`);
   await redis.set(`job:${jobId}:meta`, meta);
@@ -723,8 +1118,22 @@ async function processJob(jobId) {
   applyScreenshotEnv(cfg.screenshotMode);
 
   const analysisLanguage = writing.language === "en" ? "en" : "no";
-  const basePrompt = await buildAnalyzerPrompt(analysisLanguage);
-  const promptOverride = buildPromptOverrideFromWriting(basePrompt, writing);
+
+  let basePrompt = "";
+  try {
+    basePrompt = await buildAnalyzerPrompt(analysisLanguage);
+  } catch (err) {
+    console.warn(
+      "Could not load analyzer prompt from Redis:",
+      safeErrorMessage(err)
+    );
+    basePrompt = "";
+  }
+
+  const writingPromptOverride = buildPromptOverrideFromWriting(
+    basePrompt,
+    writing
+  );
 
   try {
     /* =========================
@@ -736,18 +1145,81 @@ async function processJob(jobId) {
       let gate = await waitIfPausedOrStopped(jobId);
       if (gate.stopped) return;
 
-      applyScreenshotEnv(cfg.screenshotMode);
-      const captureResult = await captureWebsite(meta.siteUrl);
+      let captureResult = null;
+      try {
+        captureResult = await runStep(jobId, meta, {
+          step: "capturing",
+          label: "Capture website",
+          timeoutMs: STEP_TIMEOUTS.captureMs,
+          attempts: STEP_RETRIES.capture,
+          url: meta.siteUrl,
+          fn: async () => {
+            applyScreenshotEnv(cfg.screenshotMode);
+            return captureWebsite(meta.siteUrl);
+          },
+        });
+      } catch (err) {
+        const errorMessage = safeErrorMessage(err);
+        console.error("Single capture failed:", meta.siteUrl, errorMessage);
+
+        await pushRedisResult(jobId, {
+          url: meta.siteUrl,
+          comment: "FAILED_CAPTURE",
+          status: "failed",
+          score: null,
+          page_type: "unclear",
+          analysis_payload: null,
+          createdAt: nowIso(),
+        });
+
+        meta.total = 1;
+        meta.failed = 1;
+        meta.error = errorMessage;
+        meta.status = "completed";
+        clearLiveStep(meta);
+        await persistMeta(jobId, meta);
+        return;
+      }
+
       console.log("Capture result (single):", meta.siteUrl, captureResult);
 
       gate = await waitIfPausedOrStopped(jobId);
       if (gate.stopped) return;
 
-      const scoreResult = await runScoreOnlyAnalysis(
-        meta.siteUrl,
-        analysisLanguage,
-        "openai"
-      );
+      let scoreResult = null;
+      try {
+        scoreResult = await runStep(jobId, meta, {
+          step: "scoring",
+          label: "Score website",
+          timeoutMs: STEP_TIMEOUTS.scoreMs,
+          attempts: STEP_RETRIES.score,
+          url: meta.siteUrl,
+          fn: async () =>
+            runScoreOnlyAnalysis(meta.siteUrl, analysisLanguage, "openai"),
+        });
+      } catch (err) {
+        const errorMessage = safeErrorMessage(err);
+        console.error("Single score failed:", meta.siteUrl, errorMessage);
+
+        await pushRedisResult(jobId, {
+          url: meta.siteUrl,
+          comment: "FAILED_SCORE_STEP",
+          status: "failed",
+          score: null,
+          page_type: "unclear",
+          analysis_payload: null,
+          createdAt: nowIso(),
+        });
+
+        meta.total = 1;
+        meta.failed = 1;
+        meta.error = errorMessage;
+        meta.status = "completed";
+        clearLiveStep(meta);
+        await persistMeta(jobId, meta);
+        return;
+      }
+
       console.log("Score result (single):", scoreResult);
 
       gate = await waitIfPausedOrStopped(jobId);
@@ -788,16 +1260,12 @@ async function processJob(jobId) {
           out = getPlaceholderPageComment(analysisLanguage);
           status = "placeholder";
         } else {
-          if (cfg.unreachableAction === "fallback") {
-            out = cfg.fallbackPrompt || getDefaultFallbackComment(analysisLanguage);
-            status = "fallback";
-          } else if (cfg.unreachableAction === "tag") {
-            out = "UNREACHABLE";
-            status = "unreachable";
-          } else {
-            out = "UNREACHABLE (skipped)";
-            status = "unreachable";
-          }
+          const unreachableOutcome = getUnreachableOutcome(
+            cfg,
+            analysisLanguage
+          );
+          out = unreachableOutcome.out;
+          status = unreachableOutcome.status;
         }
 
         await pushRedisResult(jobId, {
@@ -806,6 +1274,7 @@ async function processJob(jobId) {
           status,
           score: scoreValue,
           page_type: pageType,
+          analysis_payload: null,
           createdAt: nowIso(),
         });
 
@@ -813,6 +1282,7 @@ async function processJob(jobId) {
         meta.analyzed = 1;
         meta.failed = 0;
         meta.status = "completed";
+        clearLiveStep(meta);
         await persistMeta(jobId, meta);
 
         console.log(`Single job completed (${status}):`, jobId);
@@ -826,12 +1296,14 @@ async function processJob(jobId) {
           status: "failed",
           score: null,
           page_type: scoreResult?.page_type || "unclear",
+          analysis_payload: null,
           createdAt: nowIso(),
         });
 
         meta.total = 1;
         meta.failed = 1;
         meta.status = "completed";
+        clearLiveStep(meta);
         await persistMeta(jobId, meta);
 
         console.log("Single job completed (score parse failed):", jobId);
@@ -851,18 +1323,30 @@ async function processJob(jobId) {
             ? "cleared"
             : "good_site";
 
+        await consumeAnalysisCredit({
+          appUserId: meta.appUserId,
+          jobId,
+          siteUrl: meta.siteUrl,
+          rowNumber: null,
+          status,
+          score: scoreValue,
+          pageType: scoreResult?.page_type || "real_site",
+        });
+
         await pushRedisResult(jobId, {
           url: meta.siteUrl,
           comment: out,
           status,
           score: scoreValue,
           page_type: scoreResult?.page_type || "real_site",
+          analysis_payload: null,
           createdAt: nowIso(),
         });
 
         meta.total = 1;
         meta.analyzed = 1;
         meta.status = "completed";
+        clearLiveStep(meta);
         await persistMeta(jobId, meta);
 
         console.log("Single job completed (too good / high score):", jobId);
@@ -874,12 +1358,42 @@ async function processJob(jobId) {
 
       console.log("Qualified single site, starting full AI analysis...");
 
-      const analysisResult = await runAnalysis(
-        meta.siteUrl,
-        analysisLanguage,
-        "openai",
-        promptOverride
-      );
+      let analysisResult = null;
+      try {
+        analysisResult = await runStep(jobId, meta, {
+          step: "full_analysis",
+          label: "Full analysis",
+          timeoutMs: STEP_TIMEOUTS.analysisMs,
+          attempts: STEP_RETRIES.analysis,
+          url: meta.siteUrl,
+          fn: async () =>
+            runAnalysis(meta.siteUrl, analysisLanguage, "openai", basePrompt),
+        });
+      } catch (err) {
+        const errorMessage = safeErrorMessage(err);
+        console.error("Single full analysis failed:", meta.siteUrl, errorMessage);
+
+        const fallbackComment =
+          cfg.fallbackPrompt || getDefaultFallbackComment(analysisLanguage);
+
+        await pushRedisResult(jobId, {
+          url: meta.siteUrl,
+          comment: fallbackComment,
+          status: "fallback",
+          score: scoreValue,
+          page_type: scoreResult?.page_type || "real_site",
+          analysis_payload: null,
+          createdAt: nowIso(),
+        });
+
+        meta.total = 1;
+        meta.analyzed = 1;
+        meta.error = errorMessage;
+        meta.status = "completed";
+        clearLiveStep(meta);
+        await persistMeta(jobId, meta);
+        return;
+      }
 
       console.log(
         "Full analysis result received:",
@@ -898,12 +1412,15 @@ async function processJob(jobId) {
         analysisResult?.analysis?.should_generate_comment !== false &&
         finalPageType === "real_site";
 
+      const analysisPayload = buildStoredAnalysisPayload(analysisResult);
+
       let comment = "";
       let finalStatus = "success";
       let finalScore = scoreValue;
 
       if (!shouldGenerateComment) {
-        comment = cfg.fallbackPrompt || getDefaultFallbackComment(analysisLanguage);
+        comment =
+          cfg.fallbackPrompt || getDefaultFallbackComment(analysisLanguage);
         finalStatus = "fallback";
         finalScore = 0;
       } else {
@@ -914,7 +1431,20 @@ async function processJob(jobId) {
         );
       }
 
+      meta.singleAnalysisPayload = analysisPayload;
+      await persistMeta(jobId, meta);
+
       console.log("Final extracted comment:", comment);
+
+      await consumeAnalysisCredit({
+        appUserId: meta.appUserId,
+        jobId,
+        siteUrl: meta.siteUrl,
+        rowNumber: null,
+        status: finalStatus,
+        score: finalScore,
+        pageType: finalPageType,
+      });
 
       await pushRedisResult(jobId, {
         url: meta.siteUrl,
@@ -922,6 +1452,7 @@ async function processJob(jobId) {
         status: finalStatus,
         score: finalScore,
         page_type: finalPageType,
+        analysis_payload: analysisPayload,
         createdAt: nowIso(),
       });
 
@@ -931,6 +1462,7 @@ async function processJob(jobId) {
       meta.total = 1;
       meta.analyzed = 1;
       meta.status = "completed";
+      clearLiveStep(meta);
       await persistMeta(jobId, meta);
 
       console.log("Single job completed:", jobId);
@@ -943,19 +1475,68 @@ async function processJob(jobId) {
     if (meta.type === "batch") {
       console.log("Batch mode started");
       const rowsToDelete = [];
+      const batchIsCsv = isCsvBatch(meta);
+      const shouldDeleteRowsFromSheet =
+        isSheetBatch(meta) &&
+        String(meta?.sourceType || "").toLowerCase() !== "google";
 
       let allRows = [];
 
       try {
-        allRows = await pullSheetUrls({
-          userId: meta.userId,
-          sheetId: meta.sheetId,
-          sheetTab: meta.sheetTab,
-          urlColumn: meta.urlColumn,
+        allRows = await runStep(jobId, meta, {
+          step: "pull_rows",
+          label: batchIsCsv ? "Pull CSV rows" : "Pull sheet URLs",
+          timeoutMs: STEP_TIMEOUTS.pullRowsMs,
+          attempts: STEP_RETRIES.pullRows,
+          fn: async () => {
+            if (batchIsCsv) {
+              const csvRawText = meta.csvRawText || "";
+              const csvUrlColumn = meta.csvUrlColumn || "";
+              const csvMailColumn = meta.csvMailColumn || "";
+
+              console.log("CSV PULL DEBUG:", {
+                hasCsvRawText: !!csvRawText,
+                csvUrlColumn,
+                csvMailColumn,
+                firstNameColumn: meta.firstNameColumn || "",
+                companyNameColumn: meta.companyNameColumn || "",
+                industryColumn: meta.industryColumn || "",
+                locationColumn: meta.locationColumn || "",
+              });
+
+              return pullCsvRows({
+                rawText: csvRawText,
+                csvRawText,
+                urlColumn: csvUrlColumn,
+                mailColumn: csvMailColumn,
+                csvUrlColumn,
+                csvMailColumn,
+                firstNameColumn: meta.firstNameColumn || "",
+                companyNameColumn: meta.companyNameColumn || "",
+                industryColumn: meta.industryColumn || "",
+                locationColumn: meta.locationColumn || "",
+              });
+            }
+
+            return pullSheetUrls({
+              userId: meta.userId,
+              sheetId: meta.sheetId,
+              sheetTab: meta.sheetTab,
+              urlColumn: meta.urlColumn,
+              mailColumn: meta.mailColumn,
+              firstNameColumn: meta.firstNameColumn,
+              companyNameColumn: meta.companyNameColumn,
+              industryColumn: meta.industryColumn,
+              locationColumn: meta.locationColumn,
+            });
+          },
         });
       } catch (err) {
         const message =
-          err?.message || "No website URLs detected in selected URL column.";
+          safeErrorMessage(err) ||
+          (batchIsCsv
+            ? "No website URLs detected in selected CSV URL column."
+            : "No website URLs detected in selected URL column.");
 
         await pushRedisResult(jobId, {
           url: "Batch setup",
@@ -963,6 +1544,7 @@ async function processJob(jobId) {
           status: "failed",
           score: null,
           page_type: "unclear",
+          analysis_payload: null,
           createdAt: nowIso(),
         });
 
@@ -971,6 +1553,7 @@ async function processJob(jobId) {
         meta.failed = 0;
         meta.status = "completed";
         meta.error = message;
+        clearLiveStep(meta);
 
         await persistMeta(jobId, meta);
 
@@ -1003,18 +1586,106 @@ async function processJob(jobId) {
 
               console.log(`Processing row ${rowNumber}/${rows.length}:`, row.url);
 
-              applyScreenshotEnv(cfg.screenshotMode);
-              const captureResult = await captureWebsite(row.url);
+              let captureResult = null;
+              try {
+                captureResult = await runStep(jobId, meta, {
+                  step: "capturing",
+                  label: "Capture website",
+                  timeoutMs: STEP_TIMEOUTS.captureMs,
+                  attempts: STEP_RETRIES.capture,
+                  url: row.url,
+                  rowIndex: row.rowIndex,
+                  fn: async () => {
+                    applyScreenshotEnv(cfg.screenshotMode);
+                    return captureWebsite(row.url);
+                  },
+                });
+              } catch (err) {
+                const errorMessage = safeErrorMessage(err);
+                console.error("Row capture failed:", row.url, errorMessage);
+
+                const unreachableOutcome = getUnreachableOutcome(
+                  cfg,
+                  analysisLanguage
+                );
+
+                try {
+                  await maybeWriteSheet(meta, row, unreachableOutcome.sheetValue);
+                } catch (sheetErr) {
+                  console.error(
+                    "Failed to write unreachable capture outcome:",
+                    row.url,
+                    safeErrorMessage(sheetErr)
+                  );
+                }
+
+                await pushRedisResult(
+                  jobId,
+                  buildBatchResultPayload(row, {
+                    comment: unreachableOutcome.out,
+                    status: unreachableOutcome.status,
+                    score: null,
+                    page_type: "unclear",
+                    analysis_payload: null,
+                    createdAt: nowIso(),
+                  })
+                );
+
+                await queueMetaUpdate(() => {
+                  meta.analyzed += 1;
+                });
+                return;
+              }
+
               console.log("Capture result:", row.url, captureResult);
 
               rowGate = await waitIfPausedOrStopped(jobId);
               if (rowGate.stopped) return;
 
-              const scoreResult = await runScoreOnlyAnalysis(
-                row.url,
-                analysisLanguage,
-                "openai"
-              );
+              let scoreResult = null;
+              try {
+                scoreResult = await runStep(jobId, meta, {
+                  step: "scoring",
+                  label: "Score website",
+                  timeoutMs: STEP_TIMEOUTS.scoreMs,
+                  attempts: STEP_RETRIES.score,
+                  url: row.url,
+                  rowIndex: row.rowIndex,
+                  fn: async () =>
+                    runScoreOnlyAnalysis(row.url, analysisLanguage, "openai"),
+                });
+              } catch (err) {
+                const errorMessage = safeErrorMessage(err);
+                console.error("Row score failed:", row.url, errorMessage);
+
+                try {
+                  await maybeWriteSheet(meta, row, "FAILED_SCORE_STEP");
+                } catch (sheetErr) {
+                  console.error(
+                    "Failed to write score failure:",
+                    row.url,
+                    safeErrorMessage(sheetErr)
+                  );
+                }
+
+                await pushRedisResult(
+                  jobId,
+                  buildBatchResultPayload(row, {
+                    comment: "FAILED_SCORE_STEP",
+                    status: "failed",
+                    score: null,
+                    page_type: "unclear",
+                    analysis_payload: null,
+                    createdAt: nowIso(),
+                  })
+                );
+
+                await queueMetaUpdate(() => {
+                  meta.failed += 1;
+                });
+                return;
+              }
+
               console.log("Score result:", row.url, scoreResult);
 
               rowGate = await waitIfPausedOrStopped(jobId);
@@ -1053,31 +1724,28 @@ async function processJob(jobId) {
                   status = "placeholder";
                   sheetValue = out;
                 } else {
-                  if (cfg.unreachableAction === "fallback") {
-                    out = cfg.fallbackPrompt || getDefaultFallbackComment(analysisLanguage);
-                    status = "fallback";
-                    sheetValue = out;
-                  } else if (cfg.unreachableAction === "tag") {
-                    out = "UNREACHABLE";
-                    status = "unreachable";
-                    sheetValue = "UNREACHABLE";
-                  } else {
-                    out = "UNREACHABLE (skipped)";
-                    status = "unreachable";
-                    sheetValue = "";
-                  }
+                  const unreachableOutcome = getUnreachableOutcome(
+                    cfg,
+                    analysisLanguage
+                  );
+                  out = unreachableOutcome.out;
+                  status = unreachableOutcome.status;
+                  sheetValue = unreachableOutcome.sheetValue;
                 }
 
-                await writeSheet(meta, row, sheetValue);
+                await maybeWriteSheet(meta, row, sheetValue);
 
-                await pushRedisResult(jobId, {
-                  url: row.url,
-                  comment: out,
-                  status,
-                  score: scoreValue,
-                  page_type: pageType,
-                  createdAt: nowIso(),
-                });
+                await pushRedisResult(
+                  jobId,
+                  buildBatchResultPayload(row, {
+                    comment: out,
+                    status,
+                    score: scoreValue,
+                    page_type: pageType,
+                    analysis_payload: null,
+                    createdAt: nowIso(),
+                  })
+                );
 
                 await queueMetaUpdate(() => {
                   meta.analyzed += 1;
@@ -1086,16 +1754,19 @@ async function processJob(jobId) {
               }
 
               if (scoreValue === null) {
-                await writeSheet(meta, row, "FAILED_SCORE_PARSE");
+                await maybeWriteSheet(meta, row, "FAILED_SCORE_PARSE");
 
-                await pushRedisResult(jobId, {
-                  url: row.url,
-                  comment: "FAILED_SCORE_PARSE",
-                  status: "failed",
-                  score: null,
-                  page_type: scoreResult?.page_type || "unclear",
-                  createdAt: nowIso(),
-                });
+                await pushRedisResult(
+                  jobId,
+                  buildBatchResultPayload(row, {
+                    comment: "FAILED_SCORE_PARSE",
+                    status: "failed",
+                    score: null,
+                    page_type: scoreResult?.page_type || "unclear",
+                    analysis_payload: null,
+                    createdAt: nowIso(),
+                  })
+                );
 
                 await queueMetaUpdate(() => {
                   meta.failed += 1;
@@ -1110,16 +1781,29 @@ async function processJob(jobId) {
                 const text = getTooGoodMessage(analysisLanguage, score, action);
 
                 if (action === "skip") {
-                  await writeSheet(meta, row, "");
-
-                  await pushRedisResult(jobId, {
-                    url: row.url,
-                    comment: text,
+                  await consumeAnalysisCredit({
+                    appUserId: meta.appUserId,
+                    jobId,
+                    siteUrl: row.url,
+                    rowNumber,
                     status: "skipped",
                     score: scoreValue,
-                    page_type: scoreResult?.page_type || "real_site",
-                    createdAt: nowIso(),
+                    pageType: scoreResult?.page_type || "real_site",
                   });
+
+                  await maybeWriteSheet(meta, row, "");
+
+                  await pushRedisResult(
+                    jobId,
+                    buildBatchResultPayload(row, {
+                      comment: text,
+                      status: "skipped",
+                      score: scoreValue,
+                      page_type: scoreResult?.page_type || "real_site",
+                      analysis_payload: null,
+                      createdAt: nowIso(),
+                    })
+                  );
 
                   await queueMetaUpdate(() => {
                     meta.analyzed += 1;
@@ -1128,16 +1812,29 @@ async function processJob(jobId) {
                 }
 
                 if (action === "tag") {
-                  await writeSheet(meta, row, `GOOD_SITE (${score}/10)`);
-
-                  await pushRedisResult(jobId, {
-                    url: row.url,
-                    comment: text,
+                  await consumeAnalysisCredit({
+                    appUserId: meta.appUserId,
+                    jobId,
+                    siteUrl: row.url,
+                    rowNumber,
                     status: "good_site",
                     score: scoreValue,
-                    page_type: scoreResult?.page_type || "real_site",
-                    createdAt: nowIso(),
+                    pageType: scoreResult?.page_type || "real_site",
                   });
+
+                  await maybeWriteSheet(meta, row, `GOOD_SITE (${score}/10)`);
+
+                  await pushRedisResult(
+                    jobId,
+                    buildBatchResultPayload(row, {
+                      comment: text,
+                      status: "good_site",
+                      score: scoreValue,
+                      page_type: scoreResult?.page_type || "real_site",
+                      analysis_payload: null,
+                      createdAt: nowIso(),
+                    })
+                  );
 
                   await queueMetaUpdate(() => {
                     meta.analyzed += 1;
@@ -1146,16 +1843,31 @@ async function processJob(jobId) {
                 }
 
                 if (action === "delete") {
-                  rowsToDelete.push(row.rowIndex);
-
-                  await pushRedisResult(jobId, {
-                    url: row.url,
-                    comment: text,
+                  await consumeAnalysisCredit({
+                    appUserId: meta.appUserId,
+                    jobId,
+                    siteUrl: row.url,
+                    rowNumber,
                     status: "cleared",
                     score: scoreValue,
-                    page_type: scoreResult?.page_type || "real_site",
-                    createdAt: nowIso(),
+                    pageType: scoreResult?.page_type || "real_site",
                   });
+
+                  if (shouldDeleteRowsFromSheet) {
+                    rowsToDelete.push(row.rowIndex);
+                  }
+
+                  await pushRedisResult(
+                    jobId,
+                    buildBatchResultPayload(row, {
+                      comment: text,
+                      status: "cleared",
+                      score: scoreValue,
+                      page_type: scoreResult?.page_type || "real_site",
+                      analysis_payload: null,
+                      createdAt: nowIso(),
+                    })
+                  );
 
                   await queueMetaUpdate(() => {
                     meta.analyzed += 1;
@@ -1172,12 +1884,54 @@ async function processJob(jobId) {
               rowGate = await waitIfPausedOrStopped(jobId);
               if (rowGate.stopped) return;
 
-              const analysisResult = await runAnalysis(
-                row.url,
-                analysisLanguage,
-                "openai",
-                promptOverride
-              );
+              let analysisResult = null;
+              try {
+                analysisResult = await runStep(jobId, meta, {
+                  step: "full_analysis",
+                  label: "Full analysis",
+                  timeoutMs: STEP_TIMEOUTS.analysisMs,
+                  attempts: STEP_RETRIES.analysis,
+                  url: row.url,
+                  rowIndex: row.rowIndex,
+                  fn: async () =>
+                    runAnalysis(
+                      row.url,
+                      analysisLanguage,
+                      "openai",
+                      writingPromptOverride
+                    ),
+                });
+              } catch (err) {
+                const errorMessage = safeErrorMessage(err);
+                console.error("Row full analysis failed:", row.url, errorMessage);
+
+                try {
+                  await maybeWriteSheet(meta, row, "FAILED_ANALYSIS_STEP");
+                } catch (sheetErr) {
+                  console.error(
+                    "Failed to write analysis failure:",
+                    row.url,
+                    safeErrorMessage(sheetErr)
+                  );
+                }
+
+                await pushRedisResult(
+                  jobId,
+                  buildBatchResultPayload(row, {
+                    comment: "FAILED_ANALYSIS_STEP",
+                    status: "failed",
+                    score: scoreValue,
+                    page_type: scoreResult?.page_type || "real_site",
+                    analysis_payload: null,
+                    createdAt: nowIso(),
+                  })
+                );
+
+                await queueMetaUpdate(() => {
+                  meta.failed += 1;
+                });
+                return;
+              }
 
               rowGate = await waitIfPausedOrStopped(jobId);
               if (rowGate.stopped) return;
@@ -1191,12 +1945,16 @@ async function processJob(jobId) {
                 analysisResult?.analysis?.should_generate_comment !== false &&
                 finalPageType === "real_site";
 
+              const analysisPayload = buildStoredAnalysisPayload(analysisResult);
+
               let comment = "";
               let finalStatus = "success";
               let finalScore = scoreValue;
 
               if (!shouldGenerateComment) {
-                comment = cfg.fallbackPrompt || getDefaultFallbackComment(analysisLanguage);
+                comment =
+                  cfg.fallbackPrompt ||
+                  getDefaultFallbackComment(analysisLanguage);
                 finalStatus = "fallback";
                 finalScore = 0;
               } else {
@@ -1207,16 +1965,29 @@ async function processJob(jobId) {
                 );
               }
 
-              await writeSheet(meta, row, comment);
-
-              await pushRedisResult(jobId, {
-                url: row.url,
-                comment,
+              await consumeAnalysisCredit({
+                appUserId: meta.appUserId,
+                jobId,
+                siteUrl: row.url,
+                rowNumber,
                 status: finalStatus,
                 score: finalScore,
-                page_type: finalPageType,
-                createdAt: nowIso(),
+                pageType: finalPageType,
               });
+
+              await maybeWriteSheet(meta, row, comment);
+
+              await pushRedisResult(
+                jobId,
+                buildBatchResultPayload(row, {
+                  comment,
+                  status: finalStatus,
+                  score: finalScore,
+                  page_type: finalPageType,
+                  analysis_payload: analysisPayload,
+                  createdAt: nowIso(),
+                })
+              );
 
               await queueMetaUpdate(() => {
                 meta.analyzed += 1;
@@ -1225,17 +1996,20 @@ async function processJob(jobId) {
               console.error("Row failed:", row.url, err);
 
               try {
-                await writeSheet(meta, row, "FAILED");
+                await maybeWriteSheet(meta, row, "FAILED");
               } catch (_) {}
 
-              await pushRedisResult(jobId, {
-                url: row.url,
-                comment: "FAILED",
-                status: "failed",
-                score: null,
-                page_type: "unclear",
-                createdAt: nowIso(),
-              });
+              await pushRedisResult(
+                jobId,
+                buildBatchResultPayload(row, {
+                  comment: "FAILED",
+                  status: "failed",
+                  score: null,
+                  page_type: "unclear",
+                  analysis_payload: null,
+                  createdAt: nowIso(),
+                })
+              );
 
               await queueMetaUpdate(() => {
                 meta.failed += 1;
@@ -1245,16 +2019,18 @@ async function processJob(jobId) {
         );
       }
 
-      if (rowsToDelete.length > 0) {
+      if (shouldDeleteRowsFromSheet && rowsToDelete.length > 0) {
         const uniqueSortedRows = [...new Set(rowsToDelete)].sort((a, b) => b - a);
 
         for (const rowIndex of uniqueSortedRows) {
           try {
-            await deleteSheetRow({
-              userId: meta.userId,
-              sheetId: meta.sheetId,
-              sheetTab: meta.sheetTab,
+            await runStep(jobId, meta, {
+              step: "delete_row",
+              label: "Delete sheet row",
+              timeoutMs: STEP_TIMEOUTS.deleteRowMs,
+              attempts: STEP_RETRIES.deleteRow,
               rowIndex,
+              fn: async () => safeDeleteSheetRow(meta, rowIndex),
             });
           } catch (err) {
             console.error("Failed to delete row:", rowIndex, err);
@@ -1263,6 +2039,7 @@ async function processJob(jobId) {
       }
 
       meta.status = "completed";
+      clearLiveStep(meta);
       await persistMeta(jobId, meta);
 
       console.log("Batch completed:", jobId);
@@ -1278,6 +2055,7 @@ async function processJob(jobId) {
           status: "failed",
           score: meta.siteScore ?? null,
           page_type: meta.sitePageType || "unclear",
+          analysis_payload: null,
           createdAt: nowIso(),
         });
       }
@@ -1289,7 +2067,8 @@ async function processJob(jobId) {
     }
 
     meta.status = "completed";
-    meta.error = err?.message || "Unknown worker error";
+    meta.error = safeErrorMessage(err);
+    clearLiveStep(meta);
     await persistMeta(jobId, meta);
   }
 
@@ -1318,5 +2097,13 @@ async function runQueue() {
     }
   }
 }
+
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled rejection:", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err);
+});
 
 runQueue();
