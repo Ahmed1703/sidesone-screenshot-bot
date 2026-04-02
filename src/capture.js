@@ -21,7 +21,46 @@ const LOGS_DIR = path.join(OUT_DIR, "logs");
   fs.mkdirSync(dir, { recursive: true });
 });
 
+/* =========================
+   TIMEOUTS / LIMITS
+========================== */
+
 const DEFAULT_VIEWPORT = { width: 1440, height: 900 };
+
+const CAPTURE_TOTAL_TIMEOUT_MS =
+  Number(process.env.CAPTURE_TOTAL_TIMEOUT_MS) || 45000;
+
+const PLAYWRIGHT_LAUNCH_TIMEOUT_MS =
+  Number(process.env.CAPTURE_LAUNCH_TIMEOUT_MS) || 15000;
+
+const NAV_TIMEOUT_MS =
+  Number(process.env.CAPTURE_NAV_TIMEOUT_MS) || 18000;
+
+const ACTION_TIMEOUT_MS =
+  Number(process.env.CAPTURE_ACTION_TIMEOUT_MS) || 7000;
+
+const SCREENSHOT_TIMEOUT_MS =
+  Number(process.env.CAPTURE_SCREENSHOT_TIMEOUT_MS) || 12000;
+
+const FULLPAGE_SCREENSHOT_TIMEOUT_MS =
+  Number(process.env.CAPTURE_FULLPAGE_SCREENSHOT_TIMEOUT_MS) || 18000;
+
+const POPUP_CLICK_TIMEOUT_MS =
+  Number(process.env.CAPTURE_POPUP_CLICK_TIMEOUT_MS) || 1000;
+
+const POPUP_VISIBLE_TIMEOUT_MS =
+  Number(process.env.CAPTURE_POPUP_VISIBLE_TIMEOUT_MS) || 600;
+
+const SCROLL_MAX_HEIGHT =
+  Number(process.env.CAPTURE_SCROLL_MAX_HEIGHT) || 7000;
+
+/* =========================
+   HELPERS
+========================== */
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function safeFileName(str) {
   return String(str || "")
@@ -33,6 +72,13 @@ function safeFileName(str) {
     .replace(/_+/g, "_")
     .replace(/^_+|_+$/g, "")
     .slice(0, 120);
+}
+
+function safeErrorMessage(err, fallback = "Unknown capture error") {
+  if (!err) return fallback;
+  if (typeof err === "string") return err;
+  if (err instanceof Error) return err.message || fallback;
+  return String(err?.message || err || fallback);
 }
 
 /**
@@ -47,7 +93,6 @@ function normalizeMode(value) {
   if (v === "sections" || v === "recommended" || v === "precision" || v === "3")
     return "sections";
 
-  // Safe default (matches your new system normalization)
   return "sections";
 }
 
@@ -60,6 +105,65 @@ function getModeFromEnv() {
   );
 }
 
+async function safeClose(target, label = "resource") {
+  if (!target || typeof target.close !== "function") return;
+
+  try {
+    await Promise.race([
+      target.close().catch(() => {}),
+      sleep(2500),
+    ]);
+  } catch (_) {
+    console.warn(`safeClose failed for ${label}`);
+  }
+}
+
+async function installLightweightBlocking(page) {
+  const blockedTypes = new Set(["media", "eventsource", "websocket"]);
+
+  const blockedUrlParts = [
+    "googletagmanager.com",
+    "google-analytics.com",
+    "doubleclick.net",
+    "hotjar.com",
+    "clarity.ms",
+    "facebook.net",
+    "connect.facebook.net",
+    "fullstory.com",
+    "intercom.io",
+    "intercomcdn.com",
+    "segment.com",
+    "cdn.segment.com",
+    "analytics",
+    "gtm.js",
+    "fbevents.js",
+  ];
+
+  await page.route("**/*", async (route) => {
+    try {
+      const req = route.request();
+      const url = req.url().toLowerCase();
+      const type = req.resourceType();
+
+      if (blockedTypes.has(type)) {
+        await route.abort();
+        return;
+      }
+
+      if (type === "script" && blockedUrlParts.some((part) => url.includes(part))) {
+        await route.abort();
+        return;
+      }
+
+      await route.continue();
+    } catch (_) {
+      try {
+        await route.continue();
+      } catch (_) {}
+    }
+  });
+}
+
 async function dismissCommonPopups(page) {
   const selectors = [
     'button:has-text("Godta")',
@@ -67,7 +171,9 @@ async function dismissCommonPopups(page) {
     'button:has-text("Tillat alle")',
     'button:has-text("Accept")',
     'button:has-text("Allow all")',
+    'button:has-text("I agree")',
     'button:has-text("OK")',
+    'button:has-text("Close")',
     '[id*="cookie"] button',
     '[class*="cookie"] button',
     '[aria-label*="cookie" i] button',
@@ -76,42 +182,61 @@ async function dismissCommonPopups(page) {
   for (const selector of selectors) {
     try {
       const el = page.locator(selector).first();
-      if (await el.isVisible({ timeout: 700 })) {
-        await el.click({ timeout: 1200 });
-        await page.waitForTimeout(600);
+
+      if (await el.isVisible({ timeout: POPUP_VISIBLE_TIMEOUT_MS })) {
+        await el.click({ timeout: POPUP_CLICK_TIMEOUT_MS });
+        await page.waitForTimeout(450);
         return true;
       }
     } catch (_) {}
   }
+
   return false;
 }
 
 async function autoScroll(page) {
   try {
-    await page.evaluate(async () => {
-      await new Promise((resolve) => {
-        let total = 0;
-        const step = 500;
-        const maxScroll = Math.min(
-          Math.max(
-            document.documentElement?.scrollHeight || 0,
-            document.body?.scrollHeight || 0
-          ),
-          7000
-        );
+    await Promise.race([
+      page.evaluate(async (maxScrollHeight) => {
+        await new Promise((resolve) => {
+          const html = document.documentElement;
+          const body = document.body;
 
-        const timer = setInterval(() => {
-          window.scrollBy(0, step);
-          total += step;
+          const fullHeight = Math.max(
+            html?.scrollHeight || 0,
+            body?.scrollHeight || 0,
+            html?.offsetHeight || 0,
+            body?.offsetHeight || 0
+          );
 
-          if (total >= maxScroll) {
-            clearInterval(timer);
-            window.scrollTo(0, 0);
-            setTimeout(resolve, 500);
-          }
-        }, 120);
-      });
-    });
+          const maxScroll = Math.min(fullHeight, maxScrollHeight);
+          const step = 550;
+          let total = 0;
+
+          const timer = setInterval(() => {
+            window.scrollBy(0, step);
+            total += step;
+
+            if (total >= maxScroll) {
+              clearInterval(timer);
+              window.scrollTo(0, 0);
+              setTimeout(resolve, 350);
+            }
+          }, 110);
+        });
+      }, SCROLL_MAX_HEIGHT),
+      sleep(9000),
+    ]);
+  } catch (_) {}
+}
+
+async function shortSettle(page) {
+  try {
+    await page.waitForTimeout(900);
+    await Promise.race([
+      page.waitForLoadState("load", { timeout: 2500 }).catch(() => {}),
+      sleep(2600),
+    ]);
   } catch (_) {}
 }
 
@@ -128,8 +253,9 @@ async function tryGoto(page, rawUrl) {
     try {
       const response = await page.goto(url, {
         waitUntil: "domcontentloaded",
-        timeout: 25000,
+        timeout: NAV_TIMEOUT_MS,
       });
+
       return { ok: true, response, attemptedUrl: url };
     } catch (err) {
       lastError = err;
@@ -140,39 +266,50 @@ async function tryGoto(page, rawUrl) {
 }
 
 async function getPageMetrics(page) {
-  return await page.evaluate(() => {
-    const body = document.body;
-    const html = document.documentElement;
+  try {
+    return await page.evaluate(() => {
+      const body = document.body;
+      const html = document.documentElement;
 
-    const pageHeight = Math.max(
-      body ? body.scrollHeight : 0,
-      body ? body.offsetHeight : 0,
-      html ? html.clientHeight : 0,
-      html ? html.scrollHeight : 0,
-      html ? html.offsetHeight : 0
-    );
+      const pageHeight = Math.max(
+        body ? body.scrollHeight : 0,
+        body ? body.offsetHeight : 0,
+        html ? html.clientHeight : 0,
+        html ? html.scrollHeight : 0,
+        html ? html.offsetHeight : 0
+      );
 
-    return { pageHeight: Number(pageHeight) || 0 };
-  });
+      return { pageHeight: Number(pageHeight) || 0 };
+    });
+  } catch (_) {
+    return { pageHeight: 0 };
+  }
 }
 
 async function scrollTo(page, y, waitMs = 650) {
-  await page.evaluate((yy) => window.scrollTo(0, yy), y);
-  await page.waitForTimeout(waitMs);
+  try {
+    await page.evaluate((yy) => window.scrollTo(0, yy), y);
+    await page.waitForTimeout(waitMs);
+  } catch (_) {}
 }
 
 async function captureTop(page, outDir, fileBase, result) {
-  await scrollTo(page, 0, 500);
+  await scrollTo(page, 0, 450);
 
   const topPath = path.join(outDir, `${fileBase}_top.jpg`);
-  await page.screenshot({ path: topPath, type: "jpeg", quality: 75 });
+  await page.screenshot({
+    path: topPath,
+    type: "jpeg",
+    quality: 75,
+    timeout: SCREENSHOT_TIMEOUT_MS,
+  });
 
   result.desktop_top_path = topPath;
   result.image_paths = [topPath];
 }
 
 async function captureFull(page, outDir, fileBase, result) {
-  await scrollTo(page, 0, 500);
+  await scrollTo(page, 0, 450);
 
   const fullPath = path.join(outDir, `${fileBase}_full.jpg`);
   await page.screenshot({
@@ -180,6 +317,7 @@ async function captureFull(page, outDir, fileBase, result) {
     type: "jpeg",
     quality: 75,
     fullPage: true,
+    timeout: FULLPAGE_SCREENSHOT_TIMEOUT_MS,
   });
 
   result.desktop_full_path = fullPath;
@@ -203,21 +341,36 @@ async function captureSections(page, outDir, fileBase, result) {
   result.bottom_scroll_y = bottomY;
 
   // TOP
-  await scrollTo(page, topY, 500);
+  await scrollTo(page, topY, 450);
   const topPath = path.join(outDir, `${fileBase}_top.jpg`);
-  await page.screenshot({ path: topPath, type: "jpeg", quality: 75 });
+  await page.screenshot({
+    path: topPath,
+    type: "jpeg",
+    quality: 75,
+    timeout: SCREENSHOT_TIMEOUT_MS,
+  });
   result.desktop_top_path = topPath;
 
   // MID
-  await scrollTo(page, midY, 700);
+  await scrollTo(page, midY, 650);
   const midPath = path.join(outDir, `${fileBase}_mid.jpg`);
-  await page.screenshot({ path: midPath, type: "jpeg", quality: 75 });
+  await page.screenshot({
+    path: midPath,
+    type: "jpeg",
+    quality: 75,
+    timeout: SCREENSHOT_TIMEOUT_MS,
+  });
   result.desktop_mid_path = midPath;
 
   // BOTTOM
-  await scrollTo(page, bottomY, 700);
+  await scrollTo(page, bottomY, 650);
   const bottomPath = path.join(outDir, `${fileBase}_bottom.jpg`);
-  await page.screenshot({ path: bottomPath, type: "jpeg", quality: 75 });
+  await page.screenshot({
+    path: bottomPath,
+    type: "jpeg",
+    quality: 75,
+    timeout: SCREENSHOT_TIMEOUT_MS,
+  });
   result.desktop_bottom_path = bottomPath;
 
   result.image_paths = [topPath, midPath, bottomPath];
@@ -229,9 +382,6 @@ async function captureSections(page, outDir, fileBase, result) {
  *   outDir?: string,
  *   disableAutoScroll?: boolean,
  * })
- *
- * - If screenshotMode not provided, reads from env:
- *     SCREENSHOT_MODE / SCREENSHOT_STRATEGY / SIDESONE_SCREENSHOT_MODE
  */
 async function captureWebsite(rawUrl, opts = {}) {
   const requestedMode =
@@ -239,9 +389,6 @@ async function captureWebsite(rawUrl, opts = {}) {
   const screenshotMode = normalizeMode(requestedMode);
 
   const outDir = opts.outDir || DESKTOP_DIR;
-
-  // IMPORTANT: keep filename stable based on URL ONLY
-  // so analyze-manifest can find the right manifest using just the url.
   const fileBase = safeFileName(rawUrl);
 
   const result = {
@@ -249,6 +396,7 @@ async function captureWebsite(rawUrl, opts = {}) {
     attempted_url: null,
     final_url: null,
     homepage_title: null,
+    http_status: null,
 
     screenshot_mode_requested: String(requestedMode || ""),
     screenshot_mode_used: screenshotMode,
@@ -256,6 +404,11 @@ async function captureWebsite(rawUrl, opts = {}) {
     capture_status: "failed",
     capture_error: null,
     capture_warning: null,
+
+    reachable: false,
+    success: false,
+    ok: false,
+    error: null,
 
     desktop_top_path: null,
     desktop_mid_path: null,
@@ -273,26 +426,79 @@ async function captureWebsite(rawUrl, opts = {}) {
     timestamp: new Date().toISOString(),
   };
 
-  const browser = await chromium.launch({ headless: true });
+  let browser = null;
+  let context = null;
+  let page = null;
+  let timedOut = false;
+
+  const watchdog = setTimeout(async () => {
+    timedOut = true;
+
+    const timeoutMessage = `Capture timed out after ${CAPTURE_TOTAL_TIMEOUT_MS}ms`;
+
+    result.capture_status = "failed";
+    result.capture_error = timeoutMessage;
+    result.error = timeoutMessage;
+    result.success = false;
+    result.ok = false;
+
+    await safeClose(page, "page");
+    await safeClose(context, "context");
+    await safeClose(browser, "browser");
+  }, CAPTURE_TOTAL_TIMEOUT_MS);
+
+  if (typeof watchdog.unref === "function") {
+    watchdog.unref();
+  }
 
   try {
     fs.mkdirSync(outDir, { recursive: true });
 
-    const context = await browser.newContext({ viewport: DEFAULT_VIEWPORT });
-    const page = await context.newPage();
+    browser = await chromium.launch({
+      headless: true,
+      timeout: PLAYWRIGHT_LAUNCH_TIMEOUT_MS,
+      args: [
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+      ],
+    });
+
+    context = await browser.newContext({
+      viewport: DEFAULT_VIEWPORT,
+      ignoreHTTPSErrors: true,
+      javaScriptEnabled: true,
+      bypassCSP: false,
+    });
+
+    page = await context.newPage();
+    page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+    page.setDefaultTimeout(ACTION_TIMEOUT_MS);
+
+    await installLightweightBlocking(page);
+
+    page.on("crash", () => {
+      result.capture_warning = "Page crashed during capture.";
+    });
 
     const nav = await tryGoto(page, rawUrl);
-    if (!nav.ok) throw nav.error;
+
+    if (!nav.ok) {
+      throw nav.error || new Error("Navigation failed.");
+    }
 
     result.attempted_url = nav.attemptedUrl;
+    result.http_status =
+      typeof nav.response?.status === "function" ? nav.response.status() : null;
+    result.reachable = true;
 
-    // settle
-    await page.waitForTimeout(1200);
-
-    // cookies
+    await shortSettle(page);
     await dismissCommonPopups(page);
 
-    // Only autoscroll when it helps (full/sections). Top is cheap mode.
     const disableAutoScroll =
       typeof opts.disableAutoScroll === "boolean"
         ? opts.disableAutoScroll
@@ -300,11 +506,11 @@ async function captureWebsite(rawUrl, opts = {}) {
 
     if (!disableAutoScroll) {
       await autoScroll(page);
-      await page.waitForTimeout(900);
+      await page.waitForTimeout(600);
     }
 
     result.final_url = page.url();
-    result.homepage_title = await page.title();
+    result.homepage_title = await page.title().catch(() => null);
 
     if (screenshotMode === "top") {
       await captureTop(page, outDir, fileBase, result);
@@ -312,10 +518,9 @@ async function captureWebsite(rawUrl, opts = {}) {
       try {
         await captureFull(page, outDir, fileBase, result);
       } catch (e) {
-        // rare: fullPage fails on extremely long pages / memory issues
-        result.capture_warning = `fullPage failed, fell back to sections: ${
-          e && e.message ? e.message : String(e)
-        }`;
+        result.capture_warning = `fullPage failed, fell back to sections: ${safeErrorMessage(
+          e
+        )}`;
         result.screenshot_mode_used = "sections";
         await captureSections(page, outDir, fileBase, result);
       }
@@ -323,16 +528,35 @@ async function captureWebsite(rawUrl, opts = {}) {
       await captureSections(page, outDir, fileBase, result);
     }
 
-    await context.close();
     result.capture_status = "success";
+    result.success = true;
+    result.ok = true;
+    result.error = null;
   } catch (err) {
-    result.capture_error = err && err.message ? err.message : String(err);
-  } finally {
-    await browser.close();
-  }
+    const message = timedOut
+      ? result.capture_error || `Capture timed out after ${CAPTURE_TOTAL_TIMEOUT_MS}ms`
+      : safeErrorMessage(err);
 
-  const manifestPath = path.join(MANIFEST_DIR, `${fileBase}.json`);
-  fs.writeFileSync(manifestPath, JSON.stringify(result, null, 2), "utf8");
+    result.capture_status = "failed";
+    result.capture_error = message;
+    result.error = message;
+    result.success = false;
+    result.ok = false;
+  } finally {
+    clearTimeout(watchdog);
+
+    await safeClose(page, "page");
+    await safeClose(context, "context");
+    await safeClose(browser, "browser");
+
+    const manifestPath = path.join(MANIFEST_DIR, `${fileBase}.json`);
+
+    try {
+      fs.writeFileSync(manifestPath, JSON.stringify(result, null, 2), "utf8");
+    } catch (err) {
+      console.error("Failed to write manifest:", safeErrorMessage(err));
+    }
+  }
 
   return result;
 }

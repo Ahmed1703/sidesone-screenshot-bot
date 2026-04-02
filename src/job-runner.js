@@ -10,6 +10,7 @@ const { deleteSheetRow } = pushSheetResult;
 const { runAnalysis, runScoreOnlyAnalysis } = require("./analyze-manifest");
 const { captureWebsite } = require("./capture");
 const { buildAnalyzerPrompt } = require("./analyzer-prompt");
+const { verifyEmailAddress } = require("./email-verifier");
 
 const APP_BASE_URL = String(process.env.APP_BASE_URL || "").replace(/\/+$/, "");
 const INTERNAL_WORKER_SECRET = String(process.env.INTERNAL_WORKER_SECRET || "");
@@ -97,6 +98,7 @@ async function consumeAnalysisCredit({
 
 const STEP_TIMEOUTS = {
   pullRowsMs: Number(process.env.WORKER_PULL_ROWS_TIMEOUT_MS) || 45000,
+  verifyMs: Number(process.env.WORKER_VERIFY_EMAIL_TIMEOUT_MS) || 30000,
   captureMs: Number(process.env.WORKER_CAPTURE_TIMEOUT_MS) || 45000,
   scoreMs: Number(process.env.WORKER_SCORE_TIMEOUT_MS) || 45000,
   analysisMs: Number(process.env.WORKER_ANALYSIS_TIMEOUT_MS) || 70000,
@@ -106,6 +108,7 @@ const STEP_TIMEOUTS = {
 
 const STEP_RETRIES = {
   pullRows: Number(process.env.WORKER_PULL_ROWS_RETRIES) || 1,
+  verify: Number(process.env.WORKER_VERIFY_EMAIL_RETRIES) || 1,
   capture: Number(process.env.WORKER_CAPTURE_RETRIES) || 2,
   score: Number(process.env.WORKER_SCORE_RETRIES) || 2,
   analysis: Number(process.env.WORKER_ANALYSIS_RETRIES) || 2,
@@ -317,6 +320,337 @@ function buildBatchResultPayload(row, payload = {}) {
     industry: row?.industry || "",
     location: row?.location || "",
     ...payload,
+  };
+}
+
+function toBoolean(value) {
+  if (typeof value === "boolean") return value;
+  const normalized = String(value || "").trim().toLowerCase();
+  return (
+    normalized === "1" ||
+    normalized === "true" ||
+    normalized === "yes" ||
+    normalized === "enabled"
+  );
+}
+
+function getVerificationControl(meta) {
+  const enabled =
+    toBoolean(meta?.verifyEmails) ||
+    toBoolean(meta?.verificationEnabled) ||
+    toBoolean(meta?.emailVerificationEnabled) ||
+    toBoolean(meta?.emailVerification?.enabled) ||
+    toBoolean(meta?.verification?.enabled);
+
+  const verificationMode = String(
+    meta?.verificationMode ||
+      meta?.emailVerification?.mode ||
+      meta?.verification?.mode ||
+      "review"
+  )
+    .trim()
+    .toLowerCase();
+
+  const continueRequested =
+    toBoolean(meta?.continueAfterVerification) ||
+    toBoolean(meta?.verificationContinue) ||
+    toBoolean(meta?.verificationReviewCompleted) ||
+    toBoolean(meta?.verification?.reviewCompleted) ||
+    toBoolean(meta?.verification?.approved) ||
+    toBoolean(meta?.emailVerification?.reviewCompleted);
+
+  const autoExcludeBad =
+    toBoolean(meta?.autoExcludeBadEmails) ||
+    toBoolean(meta?.removeBadEmails) ||
+    toBoolean(meta?.deleteBadEmails) ||
+    toBoolean(meta?.verification?.autoExcludeBad) ||
+    toBoolean(meta?.emailVerification?.autoExcludeBad);
+
+  return {
+    enabled,
+    mode: verificationMode,
+    continueRequested,
+    autoExcludeBad,
+  };
+}
+
+function extractSingleVerificationEmail(meta) {
+  return (
+    meta?.email ||
+    meta?.recipientEmail ||
+    meta?.mail ||
+    meta?.siteEmail ||
+    meta?.contactEmail ||
+    meta?.emailToVerify ||
+    ""
+  );
+}
+
+function parseExcludedRowToken(token, rowsByEmail) {
+  if (token === null || token === undefined) return null;
+
+  if (typeof token === "number" && Number.isFinite(token)) {
+    return { rowIndex: token, rowNumber: token };
+  }
+
+  if (typeof token === "string") {
+    const trimmed = token.trim();
+    if (!trimmed) return null;
+
+    if (/^\d+$/.test(trimmed)) {
+      const value = Number(trimmed);
+      return { rowIndex: value, rowNumber: value };
+    }
+
+    const emailKey = trimmed.toLowerCase();
+    if (rowsByEmail.has(emailKey)) {
+      return { email: emailKey };
+    }
+
+    return null;
+  }
+
+  if (typeof token === "object") {
+    if (Number.isFinite(token.rowIndex)) {
+      return { rowIndex: Number(token.rowIndex) };
+    }
+
+    if (Number.isFinite(token.rowNumber)) {
+      return { rowNumber: Number(token.rowNumber) };
+    }
+
+    const emailValue = String(
+      token.email || token.normalizedEmail || token.recipientEmail || ""
+    )
+      .trim()
+      .toLowerCase();
+
+    if (emailValue) {
+      return { email: emailValue };
+    }
+  }
+
+  return null;
+}
+
+function buildExcludedRowMatcher(meta, verificationResults) {
+  const rowsByEmail = new Map();
+  for (const result of verificationResults || []) {
+    const emailKey = String(result?.normalizedEmail || result?.email || "")
+      .trim()
+      .toLowerCase();
+
+    if (emailKey) {
+      rowsByEmail.set(emailKey, result);
+    }
+  }
+
+  const rawSelections = []
+    .concat(meta?.excludedRows || [])
+    .concat(meta?.removedRows || [])
+    .concat(meta?.excludedRowNumbers || [])
+    .concat(meta?.rowsToExclude || [])
+    .concat(meta?.verification?.excludedRows || [])
+    .concat(meta?.emailVerification?.excludedRows || []);
+
+  const rowIndexes = new Set();
+  const rowNumbers = new Set();
+  const emails = new Set();
+
+  for (const token of rawSelections) {
+    const parsed = parseExcludedRowToken(token, rowsByEmail);
+    if (!parsed) continue;
+    if (parsed.rowIndex) rowIndexes.add(parsed.rowIndex);
+    if (parsed.rowNumber) rowNumbers.add(parsed.rowNumber);
+    if (parsed.email) emails.add(parsed.email);
+  }
+
+  if (getVerificationControl(meta).autoExcludeBad) {
+    for (const result of verificationResults || []) {
+      if (
+        result?.status === "invalid" ||
+        result?.status === "no_mail_domain"
+      ) {
+        if (Number.isFinite(result?.rowIndex)) rowIndexes.add(result.rowIndex);
+        if (Number.isFinite(result?.rowNumber)) rowNumbers.add(result.rowNumber);
+        const emailKey = String(result?.normalizedEmail || result?.email || "")
+          .trim()
+          .toLowerCase();
+        if (emailKey) emails.add(emailKey);
+      }
+    }
+  }
+
+  return function isExcluded(row, verificationResult) {
+    const emailKey = String(
+      verificationResult?.normalizedEmail || row?.recipientEmail || ""
+    )
+      .trim()
+      .toLowerCase();
+
+    return (
+      rowIndexes.has(row?.rowIndex) ||
+      rowNumbers.has(verificationResult?.rowNumber) ||
+      rowNumbers.has(row?.rowIndex) ||
+      (emailKey && emails.has(emailKey))
+    );
+  };
+}
+
+function buildVerificationSummary(results, excludedCount = 0) {
+  const summary = {
+    totalChecked: results.length,
+    validCount: 0,
+    invalidCount: 0,
+    riskyCount: 0,
+    badCount: 0,
+    excludedCount,
+    catchAllCount: 0,
+    temporaryFailureCount: 0,
+    noMailDomainCount: 0,
+    unknownCount: 0,
+  };
+
+  for (const result of results) {
+    switch (result?.status) {
+      case "valid":
+        summary.validCount += 1;
+        break;
+      case "invalid":
+        summary.invalidCount += 1;
+        summary.badCount += 1;
+        break;
+      case "catch_all":
+        summary.catchAllCount += 1;
+        summary.riskyCount += 1;
+        break;
+      case "temporary_failure":
+        summary.temporaryFailureCount += 1;
+        summary.riskyCount += 1;
+        break;
+      case "no_mail_domain":
+        summary.noMailDomainCount += 1;
+        summary.badCount += 1;
+        break;
+      default:
+        summary.unknownCount += 1;
+        summary.riskyCount += 1;
+        break;
+    }
+  }
+
+  return summary;
+}
+
+async function persistVerificationState(jobId, meta, verificationPayload) {
+  meta.verification = {
+    ...(meta.verification || {}),
+    ...verificationPayload,
+  };
+
+  meta.verificationResults = verificationPayload.results || [];
+  meta.verificationSummary =
+    verificationPayload.summary ||
+    buildVerificationSummary(verificationPayload.results || []);
+
+  await redis.set(`job:${jobId}:verification`, verificationPayload);
+  await persistMeta(jobId, meta);
+}
+
+async function runEmailVerificationStage({
+  jobId,
+  meta,
+  rows,
+  queueMetaUpdate,
+}) {
+  const verificationRows = rows
+    .map((row, index) => ({
+      ...row,
+      verificationRowNumber: index + 1,
+    }))
+    .filter((row) => String(row?.recipientEmail || "").trim());
+
+  const results = [];
+  const concurrency = Math.max(
+    1,
+    Number(process.env.EMAIL_VERIFY_CONCURRENCY) || 3
+  );
+
+  if (verificationRows.length === 0) {
+    return {
+      stopped: false,
+      noEmails: true,
+      results: [],
+      summary: buildVerificationSummary([]),
+      checkedAt: nowIso(),
+    };
+  }
+
+  for (let start = 0; start < verificationRows.length; start += concurrency) {
+    const gate = await waitIfPausedOrStopped(jobId);
+    if (gate.stopped) {
+      return { stopped: true, results: [] };
+    }
+
+    const chunk = verificationRows.slice(start, start + concurrency);
+
+    const chunkResults = await Promise.all(
+      chunk.map(async (row) => {
+        try {
+          return await runStep(jobId, meta, {
+            step: "verify_emails",
+            label: "Verify email",
+            timeoutMs: STEP_TIMEOUTS.verifyMs,
+            attempts: STEP_RETRIES.verify,
+            url: row.url,
+            rowIndex: row.rowIndex,
+            fn: async () =>
+              verifyEmailAddress({
+                redis,
+                email: row.recipientEmail,
+                rowNumber: row.verificationRowNumber,
+                rowIndex: row.rowIndex,
+                logger: (message) =>
+                  console.log(`[email-verify][${jobId}] ${message}`),
+              }),
+          });
+        } catch (err) {
+          return {
+            email: String(row.recipientEmail || "").trim(),
+            normalizedEmail: String(row.recipientEmail || "").trim(),
+            status: "temporary_failure",
+            confidence: 0.2,
+            reason: safeErrorMessage(err, "Email verification failed."),
+            mxHost: null,
+            catchAll: false,
+            checkedAt: nowIso(),
+            rowNumber: row.verificationRowNumber,
+            rowIndex: row.rowIndex,
+            shouldContinue: true,
+            cached: false,
+          };
+        } finally {
+          await queueMetaUpdate(() => {
+            meta.verificationProgress = {
+              checked: (meta.verificationProgress?.checked || 0) + 1,
+              total: verificationRows.length,
+            };
+          });
+        }
+      })
+    );
+
+    results.push(...chunkResults);
+  }
+
+  const summary = buildVerificationSummary(results);
+
+  return {
+    stopped: false,
+    noEmails: false,
+    results,
+    summary,
+    checkedAt: nowIso(),
   };
 }
 
@@ -1075,6 +1409,7 @@ async function processJob(jobId) {
   console.log("Processing job:", jobId);
 
   let meta = await redis.get(`job:${jobId}:meta`);
+  const priorVerificationState = await redis.get(`job:${jobId}:verification`);
   console.log("JOB META RECEIVED:", meta);
 
   if (!meta) return;
@@ -1105,6 +1440,25 @@ async function processJob(jobId) {
   meta.startedAt = meta.startedAt || nowIso();
   meta.error = null;
   meta.lastStepError = null;
+  meta.verificationProgress = {
+    checked: 0,
+    total:
+      priorVerificationState?.summary?.totalChecked ||
+      meta?.verificationSummary?.totalChecked ||
+      0,
+  };
+
+  if (priorVerificationState?.results?.length) {
+    meta.verification = {
+      ...(meta.verification || {}),
+      ...priorVerificationState,
+    };
+    meta.verificationResults = priorVerificationState.results;
+    meta.verificationSummary =
+      priorVerificationState.summary ||
+      buildVerificationSummary(priorVerificationState.results || []);
+  }
+
   clearLiveStep(meta);
 
   await redis.del(`job:${jobId}:results`);
@@ -1139,11 +1493,112 @@ async function processJob(jobId) {
     /* =========================
        SINGLE MODE
     ========================== */
-    if (meta.type === "single" && meta.siteUrl) {
-      console.log("Single site:", meta.siteUrl);
+    if (meta.type === "single") {
+      console.log("Single job:", meta.siteUrl || "[verification only]");
 
       let gate = await waitIfPausedOrStopped(jobId);
       if (gate.stopped) return;
+
+      const verificationControl = getVerificationControl(meta);
+      const singleVerificationEmail = extractSingleVerificationEmail(meta);
+
+      if (verificationControl.enabled && singleVerificationEmail) {
+        const existingResult =
+          meta?.verificationResults?.[0] || priorVerificationState?.results?.[0];
+
+        let verificationResult = existingResult;
+
+        if (!verificationResult) {
+          verificationResult = await runStep(jobId, meta, {
+            step: "verify_email",
+            label: "Verify single email",
+            timeoutMs: STEP_TIMEOUTS.verifyMs,
+            attempts: STEP_RETRIES.verify,
+            url: meta.siteUrl,
+            fn: async () =>
+              verifyEmailAddress({
+                redis,
+                email: singleVerificationEmail,
+                rowNumber: 1,
+                rowIndex: 1,
+                logger: (message) =>
+                  console.log(`[email-verify][${jobId}] ${message}`),
+              }),
+          });
+
+          const verificationPayload = {
+            enabled: true,
+            phase: "review_required",
+            type: "single",
+            emailColumn:
+              meta.emailColumn ||
+              meta.mailColumn ||
+              meta.csvMailColumn ||
+              null,
+            checkedAt: verificationResult.checkedAt,
+            summary: buildVerificationSummary([verificationResult]),
+            results: [verificationResult],
+          };
+
+          await persistVerificationState(jobId, meta, verificationPayload);
+        }
+
+        if (!verificationControl.continueRequested) {
+          await pushRedisResult(jobId, {
+            type: "email_verification",
+            status: "verification_review_required",
+            verification: {
+              type: "single",
+              email: verificationResult.email,
+              result: verificationResult,
+              summary: buildVerificationSummary([verificationResult]),
+            },
+            createdAt: nowIso(),
+          });
+
+          meta.total = 1;
+          meta.status = "awaiting_verification_review";
+          meta.awaitingUserAction = "email_verification_review";
+          clearLiveStep(meta);
+          await persistMeta(jobId, meta);
+          return;
+        }
+
+        await persistVerificationState(jobId, meta, {
+          ...(priorVerificationState || meta.verification || {}),
+          enabled: true,
+          phase: "completed",
+          type: "single",
+          reviewCompletedAt: nowIso(),
+          summary: buildVerificationSummary([verificationResult]),
+          results: [verificationResult],
+        });
+
+        if (!meta.siteUrl) {
+          await pushRedisResult(jobId, {
+            type: "email_verification",
+            status: verificationResult.status,
+            verification: {
+              type: "single",
+              email: verificationResult.email,
+              result: verificationResult,
+              summary: buildVerificationSummary([verificationResult]),
+            },
+            createdAt: nowIso(),
+          });
+
+          meta.total = 1;
+          meta.analyzed = 1;
+          meta.status = "completed";
+          clearLiveStep(meta);
+          await persistMeta(jobId, meta);
+          return;
+        }
+      }
+
+      if (!meta.siteUrl) {
+        throw new Error("Single analysis job is missing siteUrl.");
+      }
 
       let captureResult = null;
       try {
@@ -1561,12 +2016,145 @@ async function processJob(jobId) {
         return;
       }
 
-      const rows = allRows.slice(0, cfg.maxBatchSize);
+      let rows = allRows.slice(0, cfg.maxBatchSize);
+
+      const verificationControl = getVerificationControl(meta);
+      let existingVerificationResults =
+        meta?.verificationResults || priorVerificationState?.results || [];
+
+      if (verificationControl.enabled) {
+        if (!existingVerificationResults.length) {
+          const verificationRun = await runEmailVerificationStage({
+            jobId,
+            meta,
+            rows,
+            queueMetaUpdate,
+          });
+
+          if (verificationRun.stopped) return;
+
+          if (verificationRun.noEmails) {
+            await persistVerificationState(jobId, meta, {
+              enabled: true,
+              phase: "completed",
+              type: "batch",
+              checkedAt: verificationRun.checkedAt,
+              summary: verificationRun.summary,
+              results: [],
+            });
+            existingVerificationResults = [];
+          } else {
+            const verificationPayload = {
+              enabled: true,
+              phase: "review_required",
+              type: "batch",
+              emailColumn:
+                meta.emailColumn ||
+                meta.mailColumn ||
+                meta.csvMailColumn ||
+                null,
+              checkedAt: verificationRun.checkedAt,
+              summary: verificationRun.summary,
+              results: verificationRun.results,
+            };
+
+            await persistVerificationState(jobId, meta, verificationPayload);
+
+            await pushRedisResult(jobId, {
+              type: "email_verification",
+              status: "verification_review_required",
+              verification: {
+                type: "batch",
+                emailColumn: verificationPayload.emailColumn,
+                summary: verificationRun.summary,
+                results: verificationRun.results,
+              },
+              createdAt: nowIso(),
+            });
+
+            meta.total = rows.length;
+            meta.status = "awaiting_verification_review";
+            meta.awaitingUserAction = "email_verification_review";
+            clearLiveStep(meta);
+            await persistMeta(jobId, meta);
+            return;
+          }
+        }
+
+        if (existingVerificationResults.length && !verificationControl.continueRequested) {
+          await pushRedisResult(jobId, {
+            type: "email_verification",
+            status: "verification_review_required",
+            verification: {
+              type: "batch",
+              emailColumn:
+                meta.emailColumn ||
+                meta.mailColumn ||
+                meta.csvMailColumn ||
+                null,
+              summary:
+                priorVerificationState?.summary ||
+                buildVerificationSummary(existingVerificationResults),
+              results: existingVerificationResults,
+            },
+            createdAt: nowIso(),
+          });
+
+          meta.total = rows.length;
+          meta.status = "awaiting_verification_review";
+          meta.awaitingUserAction = "email_verification_review";
+          clearLiveStep(meta);
+          await persistMeta(jobId, meta);
+          return;
+        }
+
+        const isExcluded = buildExcludedRowMatcher(meta, existingVerificationResults);
+        const verificationByRowIndex = new Map(
+          existingVerificationResults.map((result) => [result.rowIndex, result])
+        );
+
+        rows = rows.filter((row) => !isExcluded(row, verificationByRowIndex.get(row.rowIndex)));
+
+        const excludedCount = existingVerificationResults.length - rows.length;
+        const verificationPayload = {
+          ...(priorVerificationState || meta.verification || {}),
+          enabled: true,
+          phase: "completed",
+          type: "batch",
+          reviewCompletedAt: nowIso(),
+          excludedRowCount: excludedCount,
+          summary: buildVerificationSummary(
+            existingVerificationResults,
+            excludedCount
+          ),
+          results: existingVerificationResults,
+        };
+
+        await persistVerificationState(jobId, meta, verificationPayload);
+      }
 
       meta.total = rows.length;
       await persistMeta(jobId, meta);
 
       console.log(`Progress: ${meta.analyzed}/${meta.total}`);
+
+      if (rows.length === 0) {
+        await pushRedisResult(jobId, {
+          type: "analysis",
+          url: "Batch verification",
+          comment: "No rows left to analyze after email verification exclusions.",
+          status: "completed",
+          score: null,
+          page_type: "unclear",
+          analysis_payload: null,
+          createdAt: nowIso(),
+        });
+
+        meta.status = "completed";
+        clearLiveStep(meta);
+        await persistMeta(jobId, meta);
+        return;
+      }
 
       const concurrency = cfg.concurrency;
 

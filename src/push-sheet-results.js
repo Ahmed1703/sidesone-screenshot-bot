@@ -1,21 +1,8 @@
 const path = require("path");
 require("dotenv").config();
-const { google } = require("googleapis");
+const { getSheetsClientForUser } = require("./google-user-sheets");
 
 const ROOT = path.join(__dirname, "..");
-
-async function getSheetsClient() {
-  const keyFile = process.env.GOOGLE_SERVICE_ACCOUNT_KEYFILE;
-  if (!keyFile) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_KEYFILE in .env");
-
-  const auth = new google.auth.GoogleAuth({
-    keyFile: path.isAbsolute(keyFile) ? keyFile : path.join(ROOT, keyFile),
-    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-  });
-
-  const client = await auth.getClient();
-  return google.sheets({ version: "v4", auth: client });
-}
 
 async function getSheetIdByName(sheets, spreadsheetId, sheetTab) {
   const spreadsheet = await sheets.spreadsheets.get({
@@ -33,23 +20,61 @@ async function getSheetIdByName(sheets, spreadsheetId, sheetTab) {
   return sheet.properties.sheetId;
 }
 
+async function ensureOutputHeader({
+  sheets,
+  sheetId,
+  sheetTab,
+  column,
+  headerText = "Website comment",
+}) {
+  const headerRange = `${sheetTab}!${column}1`;
+
+  const existing = await sheets.spreadsheets.values.get({
+    spreadsheetId: sheetId,
+    range: headerRange,
+  });
+
+  const currentHeader = String(existing.data.values?.[0]?.[0] || "").trim();
+
+  if (!currentHeader) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId,
+      range: headerRange,
+      valueInputOption: "RAW",
+      requestBody: {
+        values: [[headerText]],
+      },
+    });
+  }
+}
+
 async function pushSheetResult({
+  userId,
   sheetId,
   sheetTab,
   rowIndex,
   comment,
   column,
 }) {
+  if (!userId) throw new Error("Missing userId");
   if (!sheetId) throw new Error("Missing sheetId");
   if (!rowIndex) throw new Error("Missing rowIndex");
 
   const tab = sheetTab || "Sheet1";
   const commentCol = column || "O";
 
-  const sheets = await getSheetsClient();
+  const sheets = await getSheetsClientForUser(userId);
 
   const numericSheetId = await getSheetIdByName(sheets, sheetId, tab);
   const columnIndex = commentCol.charCodeAt(0) - 65;
+
+  await ensureOutputHeader({
+    sheets,
+    sheetId,
+    sheetTab: tab,
+    column: commentCol,
+    headerText: "Website comment",
+  });
 
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: sheetId,
@@ -86,16 +111,13 @@ async function pushSheetResult({
   });
 }
 
-async function deleteSheetRow({
-  sheetId,
-  sheetTab,
-  rowIndex,
-}) {
+async function deleteSheetRow({ userId, sheetId, sheetTab, rowIndex }) {
+  if (!userId) throw new Error("Missing userId");
   if (!sheetId) throw new Error("Missing sheetId");
   if (!rowIndex) throw new Error("Missing rowIndex");
 
   const tab = sheetTab || "Sheet1";
-  const sheets = await getSheetsClient();
+  const sheets = await getSheetsClientForUser(userId);
   const numericSheetId = await getSheetIdByName(sheets, sheetId, tab);
 
   const zeroBasedRow = Number(rowIndex) - 1;
