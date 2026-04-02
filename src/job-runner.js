@@ -10,7 +10,11 @@ const { deleteSheetRow } = pushSheetResult;
 const { runAnalysis, runScoreOnlyAnalysis } = require("./analyze-manifest");
 const { captureWebsite } = require("./capture");
 const { buildAnalyzerPrompt } = require("./analyzer-prompt");
-const { verifyEmailAddress } = require("./email-verifier");
+const {
+  verifyEmailWithBouncer,
+  verifyEmailsWithBouncerBatch,
+  getBouncerCredits,
+} = require("./bouncer-verifier");
 
 const APP_BASE_URL = String(process.env.APP_BASE_URL || "").replace(/\/+$/, "");
 const INTERNAL_WORKER_SECRET = String(process.env.INTERNAL_WORKER_SECRET || "");
@@ -92,13 +96,73 @@ async function consumeAnalysisCredit({
   };
 }
 
+async function consumeVerificationCredit({
+  appUserId,
+  jobId,
+  quantity,
+  mode,
+  batchId = null,
+}) {
+  const checkedCount = Number(quantity) || 0;
+
+  if (checkedCount <= 0) {
+    return { charged: false };
+  }
+
+  if (!appUserId) {
+    throw new Error("Missing appUserId for verification credit deduction.");
+  }
+
+  if (!APP_BASE_URL || !INTERNAL_WORKER_SECRET) {
+    throw new Error("Missing APP_BASE_URL or INTERNAL_WORKER_SECRET.");
+  }
+
+  const amount = checkedCount * 0.5;
+  const referenceKey =
+    mode === "batch"
+      ? `verification:${jobId}:batch:${batchId || "default"}`
+      : `verification:${jobId}:single`;
+
+  const res = await fetch(`${APP_BASE_URL}/api/internal/consume-credit`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-internal-worker-secret": INTERNAL_WORKER_SECRET,
+    },
+    body: JSON.stringify({
+      userId: String(appUserId),
+      amount,
+      referenceKey,
+      reason: "Email verification completed",
+      metadata: {
+        jobId,
+        quantity: checkedCount,
+        mode,
+        batchId,
+        unitPrice: 0.5,
+      },
+    }),
+  });
+
+  const data = await res.json().catch(() => null);
+
+  if (!res.ok) {
+    throw new Error(data?.error || "Verification credit deduction failed.");
+  }
+
+  return {
+    charged: true,
+    data,
+    amount,
+  };
+}
+
 /* =========================
    TIMEOUT / RETRY CONFIG
 ========================== */
 
 const STEP_TIMEOUTS = {
   pullRowsMs: Number(process.env.WORKER_PULL_ROWS_TIMEOUT_MS) || 45000,
-  verifyMs: Number(process.env.WORKER_VERIFY_EMAIL_TIMEOUT_MS) || 30000,
   captureMs: Number(process.env.WORKER_CAPTURE_TIMEOUT_MS) || 45000,
   scoreMs: Number(process.env.WORKER_SCORE_TIMEOUT_MS) || 45000,
   analysisMs: Number(process.env.WORKER_ANALYSIS_TIMEOUT_MS) || 70000,
@@ -108,7 +172,6 @@ const STEP_TIMEOUTS = {
 
 const STEP_RETRIES = {
   pullRows: Number(process.env.WORKER_PULL_ROWS_RETRIES) || 1,
-  verify: Number(process.env.WORKER_VERIFY_EMAIL_RETRIES) || 1,
   capture: Number(process.env.WORKER_CAPTURE_RETRIES) || 2,
   score: Number(process.env.WORKER_SCORE_RETRIES) || 2,
   analysis: Number(process.env.WORKER_ANALYSIS_RETRIES) || 2,
@@ -467,10 +530,7 @@ function buildExcludedRowMatcher(meta, verificationResults) {
 
   if (getVerificationControl(meta).autoExcludeBad) {
     for (const result of verificationResults || []) {
-      if (
-        result?.status === "invalid" ||
-        result?.status === "no_mail_domain"
-      ) {
+      if (result?.status === "invalid") {
         if (Number.isFinite(result?.rowIndex)) rowIndexes.add(result.rowIndex);
         if (Number.isFinite(result?.rowNumber)) rowNumbers.add(result.rowNumber);
         const emailKey = String(result?.normalizedEmail || result?.email || "")
@@ -505,9 +565,6 @@ function buildVerificationSummary(results, excludedCount = 0) {
     riskyCount: 0,
     badCount: 0,
     excludedCount,
-    catchAllCount: 0,
-    temporaryFailureCount: 0,
-    noMailDomainCount: 0,
     unknownCount: 0,
   };
 
@@ -520,21 +577,11 @@ function buildVerificationSummary(results, excludedCount = 0) {
         summary.invalidCount += 1;
         summary.badCount += 1;
         break;
-      case "catch_all":
-        summary.catchAllCount += 1;
+      case "risky":
         summary.riskyCount += 1;
-        break;
-      case "temporary_failure":
-        summary.temporaryFailureCount += 1;
-        summary.riskyCount += 1;
-        break;
-      case "no_mail_domain":
-        summary.noMailDomainCount += 1;
-        summary.badCount += 1;
         break;
       default:
         summary.unknownCount += 1;
-        summary.riskyCount += 1;
         break;
     }
   }
@@ -570,12 +617,6 @@ async function runEmailVerificationStage({
     }))
     .filter((row) => String(row?.recipientEmail || "").trim());
 
-  const results = [];
-  const concurrency = Math.max(
-    1,
-    Number(process.env.EMAIL_VERIFY_CONCURRENCY) || 3
-  );
-
   if (verificationRows.length === 0) {
     return {
       stopped: false,
@@ -586,71 +627,49 @@ async function runEmailVerificationStage({
     };
   }
 
-  for (let start = 0; start < verificationRows.length; start += concurrency) {
-    const gate = await waitIfPausedOrStopped(jobId);
-    if (gate.stopped) {
-      return { stopped: true, results: [] };
-    }
+  await queueMetaUpdate(() => {
+    meta.verificationProgress = {
+      checked: 0,
+      total: verificationRows.length,
+    };
+  });
 
-    const chunk = verificationRows.slice(start, start + concurrency);
+  console.log(`[email-verify][${jobId}] Bouncer batch verification requested.`);
 
-    const chunkResults = await Promise.all(
-      chunk.map(async (row) => {
-        try {
-          return await runStep(jobId, meta, {
-            step: "verify_emails",
-            label: "Verify email",
-            timeoutMs: STEP_TIMEOUTS.verifyMs,
-            attempts: STEP_RETRIES.verify,
-            url: row.url,
-            rowIndex: row.rowIndex,
-            fn: async () =>
-              verifyEmailAddress({
-                redis,
-                email: row.recipientEmail,
-                rowNumber: row.verificationRowNumber,
-                rowIndex: row.rowIndex,
-                logger: (message) =>
-                  console.log(`[email-verify][${jobId}] ${message}`),
-              }),
-          });
-        } catch (err) {
-          return {
-            email: String(row.recipientEmail || "").trim(),
-            normalizedEmail: String(row.recipientEmail || "").trim(),
-            status: "temporary_failure",
-            confidence: 0.2,
-            reason: safeErrorMessage(err, "Email verification failed."),
-            mxHost: null,
-            catchAll: false,
-            checkedAt: nowIso(),
-            rowNumber: row.verificationRowNumber,
-            rowIndex: row.rowIndex,
-            shouldContinue: true,
-            cached: false,
-          };
-        } finally {
-          await queueMetaUpdate(() => {
-            meta.verificationProgress = {
-              checked: (meta.verificationProgress?.checked || 0) + 1,
-              total: verificationRows.length,
-            };
-          });
-        }
-      })
+  const bouncerCredits = await getBouncerCredits().catch((err) => {
+    console.warn(
+      `[email-verify][${jobId}] Could not fetch Bouncer credits:`,
+      safeErrorMessage(err)
     );
+    return null;
+  });
 
-    results.push(...chunkResults);
-  }
+  const batchResult = await verifyEmailsWithBouncerBatch(verificationRows, {
+    logger: (message) => console.log(`[email-verify][${jobId}] ${message}`),
+  });
 
-  const summary = buildVerificationSummary(results);
+  await queueMetaUpdate(() => {
+    meta.verificationProgress = {
+      checked: verificationRows.length,
+      total: verificationRows.length,
+    };
+  });
+
+  console.log(
+    `[email-verify][${jobId}] Bouncer batch results stored for ${batchResult.results.length} email(s).`
+  );
+
+  const summary = buildVerificationSummary(batchResult.results);
 
   return {
     stopped: false,
     noEmails: false,
-    results,
+    results: batchResult.results,
     summary,
-    checkedAt: nowIso(),
+    checkedAt: batchResult.checkedAt,
+    provider: "bouncer",
+    providerBatch: batchResult.batch,
+    providerCredits: bouncerCredits,
   };
 }
 
@@ -1509,20 +1528,26 @@ async function processJob(jobId) {
         let verificationResult = existingResult;
 
         if (!verificationResult) {
+          console.log(`[email-verify][${jobId}] Bouncer single verification started.`);
+
+          const bouncerCredits = await getBouncerCredits().catch((err) => {
+            console.warn(
+              `[email-verify][${jobId}] Could not fetch Bouncer credits:`,
+              safeErrorMessage(err)
+            );
+            return null;
+          });
+
           verificationResult = await runStep(jobId, meta, {
             step: "verify_email",
-            label: "Verify single email",
-            timeoutMs: STEP_TIMEOUTS.verifyMs,
-            attempts: STEP_RETRIES.verify,
+            label: "Verify single email with Bouncer",
+            timeoutMs: Number(process.env.BOUNCER_REQUEST_TIMEOUT_MS) || 30000,
+            attempts: 1,
             url: meta.siteUrl,
             fn: async () =>
-              verifyEmailAddress({
-                redis,
-                email: singleVerificationEmail,
+              verifyEmailWithBouncer(singleVerificationEmail, {
                 rowNumber: 1,
                 rowIndex: 1,
-                logger: (message) =>
-                  console.log(`[email-verify][${jobId}] ${message}`),
               }),
           });
 
@@ -1530,25 +1555,44 @@ async function processJob(jobId) {
             enabled: true,
             phase: "review_required",
             type: "single",
+            provider: "bouncer",
             emailColumn:
               meta.emailColumn ||
               meta.mailColumn ||
               meta.csvMailColumn ||
               null,
             checkedAt: verificationResult.checkedAt,
+            providerCredits: bouncerCredits,
             summary: buildVerificationSummary([verificationResult]),
             results: [verificationResult],
           };
 
           await persistVerificationState(jobId, meta, verificationPayload);
+
+          if (!meta.verificationCreditsCharged) {
+            const creditResult = await consumeVerificationCredit({
+              appUserId: meta.appUserId,
+              jobId,
+              quantity: 1,
+              mode: "single",
+            });
+
+            console.log(
+              `[email-verify][${jobId}] Swokei verification credits consumed: ${creditResult.amount}.`
+            );
+            meta.verificationCreditsCharged = true;
+            await persistMeta(jobId, meta);
+          }
         }
 
         if (!verificationControl.continueRequested) {
+          console.log(`[email-verify][${jobId}] Verification review required.`);
           await pushRedisResult(jobId, {
             type: "email_verification",
             status: "verification_review_required",
             verification: {
               type: "single",
+              provider: "bouncer",
               email: verificationResult.email,
               result: verificationResult,
               summary: buildVerificationSummary([verificationResult]),
@@ -1564,6 +1608,7 @@ async function processJob(jobId) {
           return;
         }
 
+        console.log(`[email-verify][${jobId}] Resume after review.`);
         await persistVerificationState(jobId, meta, {
           ...(priorVerificationState || meta.verification || {}),
           enabled: true,
@@ -1580,6 +1625,7 @@ async function processJob(jobId) {
             status: verificationResult.status,
             verification: {
               type: "single",
+              provider: "bouncer",
               email: verificationResult.email,
               result: verificationResult,
               summary: buildVerificationSummary([verificationResult]),
@@ -2038,6 +2084,7 @@ async function processJob(jobId) {
               enabled: true,
               phase: "completed",
               type: "batch",
+              provider: "bouncer",
               checkedAt: verificationRun.checkedAt,
               summary: verificationRun.summary,
               results: [],
@@ -2048,23 +2095,44 @@ async function processJob(jobId) {
               enabled: true,
               phase: "review_required",
               type: "batch",
+              provider: "bouncer",
               emailColumn:
                 meta.emailColumn ||
                 meta.mailColumn ||
                 meta.csvMailColumn ||
                 null,
               checkedAt: verificationRun.checkedAt,
+              providerBatch: verificationRun.providerBatch || null,
+              providerCredits: verificationRun.providerCredits || null,
               summary: verificationRun.summary,
               results: verificationRun.results,
             };
 
             await persistVerificationState(jobId, meta, verificationPayload);
 
+            if (!meta.verificationCreditsCharged) {
+              const creditResult = await consumeVerificationCredit({
+                appUserId: meta.appUserId,
+                jobId,
+                quantity: verificationRun.results.length,
+                mode: "batch",
+                batchId: verificationRun.providerBatch?.batchId || null,
+              });
+
+              console.log(
+                `[email-verify][${jobId}] Swokei verification credits consumed: ${creditResult.amount}.`
+              );
+              meta.verificationCreditsCharged = true;
+              await persistMeta(jobId, meta);
+            }
+
+            console.log(`[email-verify][${jobId}] Verification review required.`);
             await pushRedisResult(jobId, {
               type: "email_verification",
               status: "verification_review_required",
               verification: {
                 type: "batch",
+                provider: "bouncer",
                 emailColumn: verificationPayload.emailColumn,
                 summary: verificationRun.summary,
                 results: verificationRun.results,
@@ -2082,11 +2150,13 @@ async function processJob(jobId) {
         }
 
         if (existingVerificationResults.length && !verificationControl.continueRequested) {
+          console.log(`[email-verify][${jobId}] Verification review required.`);
           await pushRedisResult(jobId, {
             type: "email_verification",
             status: "verification_review_required",
             verification: {
               type: "batch",
+              provider: "bouncer",
               emailColumn:
                 meta.emailColumn ||
                 meta.mailColumn ||
@@ -2108,6 +2178,7 @@ async function processJob(jobId) {
           return;
         }
 
+        console.log(`[email-verify][${jobId}] Resume after review.`);
         const isExcluded = buildExcludedRowMatcher(meta, existingVerificationResults);
         const verificationByRowIndex = new Map(
           existingVerificationResults.map((result) => [result.rowIndex, result])
@@ -2121,6 +2192,7 @@ async function processJob(jobId) {
           enabled: true,
           phase: "completed",
           type: "batch",
+          provider: "bouncer",
           reviewCompletedAt: nowIso(),
           excludedRowCount: excludedCount,
           summary: buildVerificationSummary(
