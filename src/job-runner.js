@@ -11,6 +11,7 @@ const { runAnalysis, runScoreOnlyAnalysis } = require("./analyze-manifest");
 const { captureWebsite } = require("./capture");
 const { buildAnalyzerPrompt } = require("./analyzer-prompt");
 const {
+  normalizeEmailAddress,
   verifyEmailWithBouncer,
   verifyEmailsWithBouncerBatch,
   getBouncerCredits,
@@ -589,16 +590,260 @@ function buildVerificationSummary(results, excludedCount = 0) {
   return summary;
 }
 
-async function persistVerificationState(jobId, meta, verificationPayload) {
+function normalizeVerificationIdentityEmail(value) {
+  return String(value || "").trim();
+}
+
+function buildRequestedVerificationIdentity(row, index = 0) {
+  const email = normalizeVerificationIdentityEmail(
+    row?.recipientEmail ||
+      row?.email ||
+      row?.normalizedEmail ||
+      row?.mail ||
+      row?.contactEmail
+  );
+  const normalized = normalizeEmailAddress(email);
+  const rowNumber = Number.isFinite(row?.verificationRowNumber)
+    ? Number(row.verificationRowNumber)
+    : Number.isFinite(row?.rowNumber)
+    ? Number(row.rowNumber)
+    : index + 1;
+  const rowIndex = Number.isFinite(row?.rowIndex)
+    ? Number(row.rowIndex)
+    : Number.isFinite(row?.verificationRowNumber)
+    ? Number(row.verificationRowNumber)
+    : rowNumber;
+
+  return {
+    email,
+    normalizedEmail: normalized.normalizedEmail || email,
+    rowNumber,
+    rowIndex,
+  };
+}
+
+function buildFallbackStoredVerificationResult(identity, originalResult = {}) {
+  const normalized = normalizeEmailAddress(identity?.email || "");
+  const status = "unknown";
+
+  return {
+    ...originalResult,
+    email: identity?.email || String(originalResult?.email || "").trim(),
+    normalizedEmail:
+      identity?.normalizedEmail ||
+      normalized.normalizedEmail ||
+      String(originalResult?.normalizedEmail || "").trim(),
+    rowNumber: Number.isFinite(identity?.rowNumber) ? identity.rowNumber : null,
+    rowIndex: Number.isFinite(identity?.rowIndex) ? identity.rowIndex : null,
+    status,
+    shouldContinue: true,
+    reason:
+      String(originalResult?.reason || "").trim() ||
+      "Verification result was repaired from the original requested row.",
+    provider:
+      originalResult?.provider ||
+      (originalResult?.bouncer ? "bouncer" : null),
+    providerStatus:
+      originalResult?.providerStatus ||
+      originalResult?.bouncer?.status ||
+      "repaired",
+    providerCredits:
+      originalResult?.providerCredits ??
+      originalResult?.credits ??
+      null,
+    score:
+      Number.isFinite(Number(originalResult?.score))
+        ? Number(originalResult.score)
+        : null,
+    toxic: originalResult?.toxic ?? null,
+    toxicity:
+      Number.isFinite(Number(originalResult?.toxicity))
+        ? Number(originalResult.toxicity)
+        : null,
+    domain:
+      originalResult?.domain || normalized.domain || null,
+    account:
+      originalResult?.account || normalized.localPart || null,
+    dns: originalResult?.dns ?? null,
+    bouncer: {
+      ...(originalResult?.bouncer || {}),
+      status:
+        originalResult?.bouncer?.status ||
+        originalResult?.providerStatus ||
+        "repaired",
+      reason:
+        originalResult?.bouncer?.reason ||
+        originalResult?.reason ||
+        "Verification result was repaired from the original requested row.",
+      retryAfter: originalResult?.bouncer?.retryAfter || null,
+    },
+  };
+}
+
+function repairStoredVerificationResult(result, identity) {
+  if (!identity) {
+    return result;
+  }
+
+  const repaired = buildFallbackStoredVerificationResult(identity, result);
+  const status = String(result?.status || repaired.status).trim().toLowerCase();
+
+  return {
+    ...repaired,
+    email: identity.email || repaired.email,
+    normalizedEmail: identity.normalizedEmail || repaired.normalizedEmail,
+    rowNumber: Number.isFinite(result?.rowNumber)
+      ? Number(result.rowNumber)
+      : repaired.rowNumber,
+    rowIndex: Number.isFinite(result?.rowIndex)
+      ? Number(result.rowIndex)
+      : repaired.rowIndex,
+    status:
+      status === "valid" ||
+      status === "invalid" ||
+      status === "risky" ||
+      status === "unknown"
+        ? status
+        : "unknown",
+    shouldContinue:
+      typeof result?.shouldContinue === "boolean"
+        ? result.shouldContinue
+        : (status || "unknown") !== "invalid",
+    reason: String(result?.reason || repaired.reason || "unknown"),
+    provider: result?.provider || repaired.provider,
+    providerStatus: result?.providerStatus || repaired.providerStatus,
+    providerCredits:
+      result?.providerCredits ??
+      result?.credits ??
+      repaired.providerCredits,
+    score:
+      Number.isFinite(Number(result?.score))
+        ? Number(result.score)
+        : repaired.score,
+    toxic: result?.toxic ?? repaired.toxic,
+    toxicity:
+      Number.isFinite(Number(result?.toxicity))
+        ? Number(result.toxicity)
+        : repaired.toxicity,
+    domain: result?.domain || repaired.domain,
+    account: result?.account || repaired.account,
+    dns: result?.dns ?? repaired.dns,
+    bouncer: {
+      ...(repaired.bouncer || {}),
+      ...(result?.bouncer || {}),
+      status:
+        result?.bouncer?.status ||
+        result?.providerStatus ||
+        repaired.bouncer?.status ||
+        null,
+      reason:
+        result?.bouncer?.reason ||
+        result?.reason ||
+        repaired.bouncer?.reason ||
+        null,
+      retryAfter:
+        result?.bouncer?.retryAfter ||
+        repaired.bouncer?.retryAfter ||
+        null,
+    },
+  };
+}
+
+function normalizeStoredVerificationResults(results, requestedRows = []) {
+  const identities = requestedRows.map((row, index) =>
+    buildRequestedVerificationIdentity(row, index)
+  );
+
+  if (!identities.length) {
+    return (results || []).map((result, index) =>
+      repairStoredVerificationResult(
+        result,
+        buildRequestedVerificationIdentity(result, index)
+      )
+    );
+  }
+
+  const normalizedResults = Array.isArray(results) ? results : [];
+  const usedIndexes = new Set();
+
+  function claimMatch(predicate) {
+    const matchIndex = normalizedResults.findIndex(
+      (result, index) => !usedIndexes.has(index) && predicate(result)
+    );
+
+    if (matchIndex >= 0) {
+      usedIndexes.add(matchIndex);
+      return normalizedResults[matchIndex];
+    }
+
+    return null;
+  }
+
+  return identities.map((identity) => {
+    const identityEmail = String(identity.email || "").trim().toLowerCase();
+    const identityNormalizedEmail = String(identity.normalizedEmail || "")
+      .trim()
+      .toLowerCase();
+
+    const matchedResult =
+      claimMatch(
+        (result) =>
+          Number.isFinite(identity.rowIndex) &&
+          Number(result?.rowIndex) === identity.rowIndex
+      ) ||
+      claimMatch(
+        (result) =>
+          Number.isFinite(identity.rowNumber) &&
+          Number(result?.rowNumber) === identity.rowNumber
+      ) ||
+      claimMatch((result) => {
+        const resultNormalizedEmail = String(result?.normalizedEmail || "")
+          .trim()
+          .toLowerCase();
+        const resultEmail = String(result?.email || "")
+          .trim()
+          .toLowerCase();
+
+        return (
+          (identityNormalizedEmail &&
+            resultNormalizedEmail &&
+            resultNormalizedEmail === identityNormalizedEmail) ||
+          (identityEmail && resultEmail && resultEmail === identityEmail)
+        );
+      });
+
+    return repairStoredVerificationResult(matchedResult, identity);
+  });
+}
+
+async function persistVerificationState(
+  jobId,
+  meta,
+  verificationPayload,
+  requestedRows = []
+) {
+  const normalizedResults = normalizeStoredVerificationResults(
+    verificationPayload.results || [],
+    requestedRows
+  );
+
+  verificationPayload = {
+    ...verificationPayload,
+    results: normalizedResults,
+    summary:
+      verificationPayload.summary ||
+      buildVerificationSummary(normalizedResults),
+  };
+
   meta.verification = {
     ...(meta.verification || {}),
     ...verificationPayload,
   };
 
-  meta.verificationResults = verificationPayload.results || [];
+  meta.verificationResults = normalizedResults;
   meta.verificationSummary =
     verificationPayload.summary ||
-    buildVerificationSummary(verificationPayload.results || []);
+    buildVerificationSummary(normalizedResults);
 
   await redis.set(`job:${jobId}:verification`, verificationPayload);
   await persistMeta(jobId, meta);
@@ -647,6 +892,10 @@ async function runEmailVerificationStage({
   const batchResult = await verifyEmailsWithBouncerBatch(verificationRows, {
     logger: (message) => console.log(`[email-verify][${jobId}] ${message}`),
   });
+  const normalizedVerificationResults = normalizeStoredVerificationResults(
+    batchResult.results,
+    verificationRows
+  );
 
   await queueMetaUpdate(() => {
     meta.verificationProgress = {
@@ -656,15 +905,15 @@ async function runEmailVerificationStage({
   });
 
   console.log(
-    `[email-verify][${jobId}] Bouncer batch results stored for ${batchResult.results.length} email(s).`
+    `[email-verify][${jobId}] Bouncer batch results stored for ${normalizedVerificationResults.length} email(s).`
   );
 
-  const summary = buildVerificationSummary(batchResult.results);
+  const summary = buildVerificationSummary(normalizedVerificationResults);
 
   return {
     stopped: false,
     noEmails: false,
-    results: batchResult.results,
+    results: normalizedVerificationResults,
     summary,
     checkedAt: batchResult.checkedAt,
     provider: "bouncer",
@@ -1525,7 +1774,18 @@ async function processJob(jobId) {
         const existingResult =
           meta?.verificationResults?.[0] || priorVerificationState?.results?.[0];
 
-        let verificationResult = existingResult;
+        let verificationResult = existingResult
+          ? normalizeStoredVerificationResults(
+              [existingResult],
+              [
+                {
+                  recipientEmail: singleVerificationEmail,
+                  verificationRowNumber: 1,
+                  rowIndex: 1,
+                },
+              ]
+            )[0]
+          : existingResult;
 
         if (!verificationResult) {
           console.log(`[email-verify][${jobId}] Bouncer single verification started.`);
@@ -1567,7 +1827,28 @@ async function processJob(jobId) {
             results: [verificationResult],
           };
 
-          await persistVerificationState(jobId, meta, verificationPayload);
+          await persistVerificationState(
+            jobId,
+            meta,
+            verificationPayload,
+            [
+              {
+                recipientEmail: singleVerificationEmail,
+                verificationRowNumber: 1,
+                rowIndex: 1,
+              },
+            ]
+          );
+          verificationResult = normalizeStoredVerificationResults(
+            [verificationResult],
+            [
+              {
+                recipientEmail: singleVerificationEmail,
+                verificationRowNumber: 1,
+                rowIndex: 1,
+              },
+            ]
+          )[0];
 
           if (!meta.verificationCreditsCharged) {
             const creditResult = await consumeVerificationCredit({
@@ -1617,7 +1898,13 @@ async function processJob(jobId) {
           reviewCompletedAt: nowIso(),
           summary: buildVerificationSummary([verificationResult]),
           results: [verificationResult],
-        });
+        }, [
+          {
+            recipientEmail: singleVerificationEmail,
+            verificationRowNumber: 1,
+            rowIndex: 1,
+          },
+        ]);
 
         if (!meta.siteUrl) {
           await pushRedisResult(jobId, {
@@ -2063,10 +2350,23 @@ async function processJob(jobId) {
       }
 
       let rows = allRows.slice(0, cfg.maxBatchSize);
+      const requestedVerificationRows = rows
+        .map((row, index) => ({
+          ...row,
+          verificationRowNumber: index + 1,
+        }))
+        .filter((row) => String(row?.recipientEmail || "").trim());
 
       const verificationControl = getVerificationControl(meta);
       let existingVerificationResults =
         meta?.verificationResults || priorVerificationState?.results || [];
+
+      if (verificationControl.enabled && existingVerificationResults.length) {
+        existingVerificationResults = normalizeStoredVerificationResults(
+          existingVerificationResults,
+          requestedVerificationRows
+        );
+      }
 
       if (verificationControl.enabled) {
         if (!existingVerificationResults.length) {
@@ -2088,7 +2388,7 @@ async function processJob(jobId) {
               checkedAt: verificationRun.checkedAt,
               summary: verificationRun.summary,
               results: [],
-            });
+            }, []);
             existingVerificationResults = [];
           } else {
             const verificationPayload = {
@@ -2108,13 +2408,22 @@ async function processJob(jobId) {
               results: verificationRun.results,
             };
 
-            await persistVerificationState(jobId, meta, verificationPayload);
+            await persistVerificationState(
+              jobId,
+              meta,
+              verificationPayload,
+              verificationRows
+            );
+            existingVerificationResults = normalizeStoredVerificationResults(
+              verificationRun.results,
+              verificationRows
+            );
 
             if (!meta.verificationCreditsCharged) {
               const creditResult = await consumeVerificationCredit({
                 appUserId: meta.appUserId,
                 jobId,
-                quantity: verificationRun.results.length,
+                quantity: existingVerificationResults.length,
                 mode: "batch",
                 batchId: verificationRun.providerBatch?.batchId || null,
               });
@@ -2134,8 +2443,8 @@ async function processJob(jobId) {
                 type: "batch",
                 provider: "bouncer",
                 emailColumn: verificationPayload.emailColumn,
-                summary: verificationRun.summary,
-                results: verificationRun.results,
+                summary: buildVerificationSummary(existingVerificationResults),
+                results: existingVerificationResults,
               },
               createdAt: nowIso(),
             });
@@ -2202,7 +2511,7 @@ async function processJob(jobId) {
           results: existingVerificationResults,
         };
 
-        await persistVerificationState(jobId, meta, verificationPayload);
+        await persistVerificationState(jobId, meta, verificationPayload, rows);
       }
 
       meta.total = rows.length;
