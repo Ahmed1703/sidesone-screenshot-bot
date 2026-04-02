@@ -23,6 +23,13 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function safeErrorMessage(err, fallback = "Unknown error") {
+  if (!err) return fallback;
+  if (typeof err === "string") return err;
+  if (err instanceof Error) return String(err.message || fallback);
+  return String(err?.message || err || fallback);
+}
+
 function normalizeEmailAddress(input) {
   const raw = String(input || "").trim().replace(/^<|>$/g, "");
   const atIndex = raw.lastIndexOf("@");
@@ -153,6 +160,65 @@ function shouldContinueForStatus(status) {
   return status !== "invalid";
 }
 
+function normalizeOptionalNumber(value) {
+  const numericValue = Number(value);
+  return Number.isFinite(numericValue) ? numericValue : null;
+}
+
+function buildBouncerMeta(raw, extras = {}) {
+  return {
+    status: raw?.status || extras.providerStatus || null,
+    reason: raw?.reason || extras.providerReason || null,
+    retryAfter: raw?.retryAfter || null,
+  };
+}
+
+function buildFallbackVerificationResult(email, extras = {}, fallback = {}) {
+  const normalized = normalizeEmailAddress(email);
+  const status = fallback.status || "unknown";
+  const provider =
+    fallback.provider ||
+    extras.provider ||
+    (extras.providerAttempted ? "bouncer" : null);
+  const reason =
+    fallback.reason ||
+    extras.providerReason ||
+    "Verification provider returned no usable result.";
+
+  return {
+    email: String(email || "").trim(),
+    normalizedEmail: normalized.normalizedEmail,
+    status,
+    confidence: statusConfidence(status, fallback.score),
+    reason,
+    provider,
+    providerStatus:
+      fallback.providerStatus || extras.providerStatus || "unavailable",
+    providerCredits:
+      fallback.providerCredits ??
+      extras.providerCredits ??
+      normalizeOptionalNumber(extras.credits),
+    score: normalizeOptionalNumber(fallback.score),
+    toxic: fallback.toxic ?? null,
+    toxicity: normalizeOptionalNumber(fallback.toxicity),
+    domain: fallback.domain || normalized.domain || null,
+    account: fallback.account || normalized.localPart || null,
+    dns: fallback.dns || null,
+    bouncer: buildBouncerMeta(
+      {
+        status: fallback.providerStatus || extras.providerStatus || "unavailable",
+        reason,
+        retryAfter: fallback.retryAfter || null,
+      },
+      extras
+    ),
+    checkedAt: extras.checkedAt || nowIso(),
+    rowNumber: Number.isFinite(extras.rowNumber) ? extras.rowNumber : null,
+    rowIndex: Number.isFinite(extras.rowIndex) ? extras.rowIndex : null,
+    shouldContinue: shouldContinueForStatus(status),
+  };
+}
+
 function mapBouncerResult(raw, extras = {}) {
   const normalized = normalizeEmailAddress(raw?.email || extras.email || "");
   const status = mapBouncerStatus(raw?.status);
@@ -163,20 +229,19 @@ function mapBouncerResult(raw, extras = {}) {
     status,
     confidence: statusConfidence(status, raw?.score),
     reason: String(raw?.reason || "unknown"),
-    provider: raw?.provider || null,
-    score: Number.isFinite(Number(raw?.score)) ? Number(raw.score) : null,
+    provider: raw?.provider || extras.provider || "bouncer",
+    providerStatus: raw?.status || extras.providerStatus || null,
+    providerCredits:
+      raw?.credits ??
+      extras.providerCredits ??
+      normalizeOptionalNumber(extras.credits),
+    score: normalizeOptionalNumber(raw?.score),
     toxic: raw?.toxic ?? null,
-    toxicity: Number.isFinite(Number(raw?.toxicity))
-      ? Number(raw.toxicity)
-      : null,
-    domain: raw?.domain || null,
-    account: raw?.account || null,
+    toxicity: normalizeOptionalNumber(raw?.toxicity),
+    domain: raw?.domain || normalized.domain || null,
+    account: raw?.account || normalized.localPart || null,
     dns: raw?.dns || null,
-    bouncer: {
-      status: raw?.status || null,
-      reason: raw?.reason || null,
-      retryAfter: raw?.retryAfter || null,
-    },
+    bouncer: buildBouncerMeta(raw, extras),
     checkedAt: extras.checkedAt || nowIso(),
     rowNumber: Number.isFinite(extras.rowNumber) ? extras.rowNumber : null,
     rowIndex: Number.isFinite(extras.rowIndex) ? extras.rowIndex : null,
@@ -192,12 +257,16 @@ function buildInvalidLocalResult(email, extras = {}) {
     status: "invalid",
     confidence: 1,
     reason: normalized.reason || "invalid_email",
-    provider: null,
+    provider: extras.provider || null,
+    providerStatus: "undeliverable",
+    providerCredits:
+      extras.providerCredits ??
+      normalizeOptionalNumber(extras.credits),
     score: 0,
     toxic: null,
     toxicity: null,
-    domain: null,
-    account: null,
+    domain: normalized.domain || null,
+    account: normalized.localPart || null,
     dns: null,
     bouncer: {
       status: "undeliverable",
@@ -222,25 +291,61 @@ async function getBouncerCredits() {
 
 async function verifyEmailWithBouncer(email, extras = {}) {
   const normalized = normalizeEmailAddress(email);
+  const checkedAt = extras.checkedAt || nowIso();
 
   if (!normalized.ok) {
-    return buildInvalidLocalResult(email, extras);
+    return buildInvalidLocalResult(email, {
+      ...extras,
+      checkedAt,
+    });
   }
 
-  const params = new URLSearchParams({
-    email: normalized.normalizedEmail,
-    timeout: String(BOUNCER_REALTIME_TIMEOUT_SECONDS),
-  });
+  try {
+    const params = new URLSearchParams({
+      email: normalized.normalizedEmail,
+      timeout: String(BOUNCER_REALTIME_TIMEOUT_SECONDS),
+    });
 
-  const data = await fetchBouncerJson(`/v1.1/email/verify?${params}`, {
-    method: "GET",
-  });
+    const data = await fetchBouncerJson(`/v1.1/email/verify?${params}`, {
+      method: "GET",
+    });
 
-  return mapBouncerResult(data, {
-    ...extras,
-    email: normalized.normalizedEmail,
-    checkedAt: nowIso(),
-  });
+    const hasUsableResult =
+      data &&
+      typeof data === "object" &&
+      String(data?.email || "").trim();
+
+    if (!hasUsableResult) {
+      return buildFallbackVerificationResult(email, {
+        ...extras,
+        checkedAt,
+        provider: "bouncer",
+        providerAttempted: true,
+        providerStatus: "missing_result",
+      }, {
+        reason:
+          "Bouncer returned no usable verification result for this email.",
+      });
+    }
+
+    return mapBouncerResult(data, {
+      ...extras,
+      email: normalized.normalizedEmail,
+      checkedAt,
+      provider: "bouncer",
+    });
+  } catch (err) {
+    return buildFallbackVerificationResult(email, {
+      ...extras,
+      checkedAt,
+      provider: "bouncer",
+      providerAttempted: true,
+      providerStatus: err?.name === "AbortError" ? "timeout" : "error",
+      providerReason: safeErrorMessage(err),
+    }, {
+      reason: `Bouncer single verification failed: ${safeErrorMessage(err)}.`,
+    });
+  }
 }
 
 async function createBouncerBatch(emails) {
@@ -292,6 +397,8 @@ async function verifyEmailsWithBouncerBatch(rows, { logger } = {}) {
     validRows.push({
       ...row,
       normalizedEmail: normalized.normalizedEmail,
+      normalizedDomain: normalized.domain || null,
+      normalizedAccount: normalized.localPart || null,
     });
   }
 
@@ -305,35 +412,45 @@ async function verifyEmailsWithBouncerBatch(rows, { logger } = {}) {
     };
   }
 
-  logger?.(`Bouncer batch create started for ${validRows.length} email(s).`);
-  const creation = await createBouncerBatch(
-    validRows.map((row) => row.normalizedEmail)
-  );
-  logger?.(`Bouncer batch created: ${creation.batchId}.`);
-
-  const startedAt = Date.now();
+  let creation = null;
   let status = null;
+  let downloaded = [];
+  let batchFailure = null;
 
-  while (Date.now() - startedAt < BOUNCER_BATCH_MAX_WAIT_MS) {
-    status = await getBouncerBatchStatus(creation.batchId);
-    logger?.(
-      `Bouncer batch status polled: ${creation.batchId} -> ${status.status}.`
+  try {
+    logger?.(`Bouncer batch create started for ${validRows.length} email(s).`);
+    creation = await createBouncerBatch(
+      validRows.map((row) => row.normalizedEmail)
     );
+    logger?.(`Bouncer batch created: ${creation.batchId}.`);
 
-    if (String(status?.status || "").toLowerCase() === "completed") {
-      break;
+    const startedAt = Date.now();
+
+    while (Date.now() - startedAt < BOUNCER_BATCH_MAX_WAIT_MS) {
+      status = await getBouncerBatchStatus(creation.batchId);
+      logger?.(
+        `Bouncer batch status polled: ${creation.batchId} -> ${status.status}.`
+      );
+
+      if (String(status?.status || "").toLowerCase() === "completed") {
+        break;
+      }
+
+      await sleep(BOUNCER_BATCH_POLL_INTERVAL_MS);
     }
 
-    await sleep(BOUNCER_BATCH_POLL_INTERVAL_MS);
+    if (String(status?.status || "").toLowerCase() !== "completed") {
+      throw new Error(
+        `Bouncer batch ${creation.batchId} did not complete within ${BOUNCER_BATCH_MAX_WAIT_MS}ms.`
+      );
+    }
+
+    downloaded = await getBouncerBatchResults(creation.batchId);
+  } catch (err) {
+    batchFailure = err;
+    logger?.(`Bouncer batch fallback engaged: ${safeErrorMessage(err)}.`);
   }
 
-  if (String(status?.status || "").toLowerCase() !== "completed") {
-    throw new Error(
-      `Bouncer batch ${creation.batchId} did not complete within ${BOUNCER_BATCH_MAX_WAIT_MS}ms.`
-    );
-  }
-
-  const downloaded = await getBouncerBatchResults(creation.batchId);
   const resultByEmail = new Map();
 
   for (const item of downloaded || []) {
@@ -343,60 +460,67 @@ async function verifyEmailsWithBouncerBatch(rows, { logger } = {}) {
     }
   }
 
-  const mappedResults = [];
-  for (const row of validRows) {
+  const mappedResults = validRows.map((row) => {
     const raw = resultByEmail.get(row.normalizedEmail.toLowerCase());
+    const extras = {
+      rowNumber: row.verificationRowNumber,
+      rowIndex: row.rowIndex,
+      checkedAt,
+      provider: "bouncer",
+      providerAttempted: true,
+      providerCredits: status?.credits ?? null,
+    };
 
-    if (!raw) {
-      mappedResults.push({
-        email: row.recipientEmail,
-        normalizedEmail: row.normalizedEmail,
-        status: "unknown",
-        confidence: 0.2,
-        reason: "unknown",
-        provider: null,
-        score: null,
-        toxic: null,
-        toxicity: null,
-        domain: null,
-        account: null,
-        dns: null,
-        bouncer: {
-          status: "unknown",
-          reason: "missing_batch_result",
-          retryAfter: null,
-        },
-        checkedAt,
-        rowNumber: row.verificationRowNumber,
-        rowIndex: row.rowIndex,
-        shouldContinue: true,
-      });
-      continue;
+    if (raw && typeof raw === "object") {
+      return mapBouncerResult(raw, extras);
     }
 
-    mappedResults.push(
-      mapBouncerResult(raw, {
-        rowNumber: row.verificationRowNumber,
-        rowIndex: row.rowIndex,
-        checkedAt,
-      })
-    );
-  }
+    if (batchFailure) {
+      const providerStatus =
+        batchFailure?.name === "AbortError"
+          ? "timeout"
+          : status?.status || creation?.status || "error";
+
+      return buildFallbackVerificationResult(row.recipientEmail, {
+        ...extras,
+        providerStatus,
+        providerReason: safeErrorMessage(batchFailure),
+      }, {
+        reason: `Bouncer batch verification failed before a result was available for this email: ${safeErrorMessage(batchFailure)}.`,
+        domain: row.normalizedDomain,
+        account: row.normalizedAccount,
+      });
+    }
+
+    return buildFallbackVerificationResult(row.recipientEmail, {
+      ...extras,
+      providerStatus: status?.status || "completed",
+      providerReason: "missing_batch_result",
+    }, {
+      reason:
+        "Bouncer batch completed without a matching verification result for this email.",
+      domain: row.normalizedDomain,
+      account: row.normalizedAccount,
+    });
+  });
 
   return {
     mode: "batch",
     checkedAt,
     batch: {
-      batchId: creation.batchId,
-      created: creation.created || checkedAt,
-      quantity: creation.quantity || validRows.length,
-      duplicates: creation.duplicates || 0,
-      status: status.status || creation.status || "completed",
-      processed: status.processed || validRows.length,
-      credits: status.credits ?? null,
-      stats: status.stats || null,
+      batchId: creation?.batchId || null,
+      created: creation?.created || checkedAt,
+      quantity: creation?.quantity || validRows.length,
+      duplicates: creation?.duplicates || 0,
+      status:
+        status?.status ||
+        creation?.status ||
+        (batchFailure ? "failed" : "completed"),
+      processed: status?.processed || (batchFailure ? 0 : validRows.length),
+      credits: status?.credits ?? null,
+      stats: status?.stats || null,
     },
-    credits: status.credits ?? null,
+    credits: status?.credits ?? null,
     results: mappedResults.concat(localInvalidResults),
   };
 }
