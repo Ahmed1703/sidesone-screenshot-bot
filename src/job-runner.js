@@ -438,6 +438,16 @@ function getVerificationControl(meta) {
   };
 }
 
+function isVerificationOnlyBatch(meta, verificationControl = null) {
+  const control = verificationControl || getVerificationControl(meta);
+
+  return (
+    toBoolean(meta?.verificationOnly) ||
+    toBoolean(meta?.verifyOnly) ||
+    control.mode === "only"
+  );
+}
+
 function extractSingleVerificationEmail(meta) {
   return (
     meta?.email ||
@@ -2377,6 +2387,10 @@ async function processJob(jobId) {
         .filter((row) => String(row?.recipientEmail || "").trim());
 
       const verificationControl = getVerificationControl(meta);
+      const verificationOnlyBatch = isVerificationOnlyBatch(
+        meta,
+        verificationControl
+      );
       let existingVerificationResults =
         meta?.verificationResults || priorVerificationState?.results || [];
 
@@ -2507,6 +2521,62 @@ async function processJob(jobId) {
         }
 
         console.log(`[email-verify][${jobId}] Resume after review.`);
+        if (verificationOnlyBatch) {
+          const excludedCount = Math.max(
+            0,
+            Number(meta?.verification?.excludedRowCount) || 0
+          );
+          const verificationPayload = {
+            ...(priorVerificationState || meta.verification || {}),
+            enabled: true,
+            phase: "completed",
+            type: "batch",
+            provider: "bouncer",
+            reviewCompletedAt: nowIso(),
+            excludedRowCount: excludedCount,
+            summary: buildVerificationSummary(
+              existingVerificationResults,
+              excludedCount
+            ),
+            results: existingVerificationResults,
+          };
+
+          await persistVerificationState(
+            jobId,
+            meta,
+            verificationPayload,
+            requestedVerificationRows
+          );
+
+          await pushRedisResult(jobId, {
+            type: "email_verification",
+            status: "completed",
+            verification: {
+              type: "batch",
+              provider: "bouncer",
+              emailColumn:
+                meta.emailColumn ||
+                meta.mailColumn ||
+                meta.csvMailColumn ||
+                null,
+              summary: buildVerificationSummary(
+                existingVerificationResults,
+                excludedCount
+              ),
+              results: existingVerificationResults,
+            },
+            createdAt: nowIso(),
+          });
+
+          meta.total = existingVerificationResults.length;
+          meta.analyzed = existingVerificationResults.length;
+          meta.failed = 0;
+          meta.status = "completed";
+          clearLiveStep(meta);
+          await persistMeta(jobId, meta);
+          return;
+        }
+
         const isExcluded = buildExcludedRowMatcher(meta, existingVerificationResults);
         const verificationByRowIndex = new Map(
           existingVerificationResults.map((result) => [result.rowIndex, result])
@@ -2514,7 +2584,10 @@ async function processJob(jobId) {
 
         rows = rows.filter((row) => !isExcluded(row, verificationByRowIndex.get(row.rowIndex)));
 
-        const excludedCount = existingVerificationResults.length - rows.length;
+        const excludedCount = Math.max(
+          0,
+          existingVerificationResults.length - rows.length
+        );
         const verificationPayload = {
           ...(priorVerificationState || meta.verification || {}),
           enabled: true,
