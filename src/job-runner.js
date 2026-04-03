@@ -621,6 +621,16 @@ function getRequestedVerificationEntries(meta, rows = []) {
   return rows;
 }
 
+function getVerificationRowEmail(row) {
+  return String(
+    row?.recipientEmail ||
+      row?.email ||
+      row?.mail ||
+      row?.contactEmail ||
+      ""
+  ).trim();
+}
+
 function hasVerificationResults(results) {
   return Array.isArray(results) && results.length > 0;
 }
@@ -659,19 +669,23 @@ function getPersistedVerificationState(meta, priorVerificationState) {
   return null;
 }
 
-function shouldRunFreshVerification(meta, verificationState, verificationControl) {
-  const requestedEntries = getRequestedVerificationEntries(meta, []).filter((row) =>
-    String(row?.recipientEmail || "").trim()
-  );
-
+function shouldRunFreshVerification({
+  verificationControl,
+  verificationState,
+  requestedVerificationRows = [],
+}) {
   return (
     !!verificationControl?.enabled &&
-    requestedEntries.length > 0 &&
+    requestedVerificationRows.length > 0 &&
     !hasVerificationResults(verificationState?.results)
   );
 }
 
-function shouldWaitForVerificationReview(meta, verificationState, verificationControl) {
+function shouldWaitForVerificationReview({
+  verificationControl,
+  verificationState,
+  meta,
+}) {
   return (
     !!verificationControl?.enabled &&
     hasVerificationResults(verificationState?.results) &&
@@ -679,7 +693,11 @@ function shouldWaitForVerificationReview(meta, verificationState, verificationCo
   );
 }
 
-function shouldResumeAfterVerification(meta, verificationState, verificationControl) {
+function shouldResumeAfterVerification({
+  verificationControl,
+  verificationState,
+  meta,
+}) {
   return (
     !!verificationControl?.enabled &&
     hasVerificationResults(verificationState?.results) &&
@@ -945,13 +963,14 @@ async function runEmailVerificationStage({
   const verificationRows = getRequestedVerificationEntries(meta, rows)
     .map((row, index) => ({
       ...row,
+      recipientEmail: getVerificationRowEmail(row),
       verificationRowNumber: Number.isFinite(row?.verificationRowNumber)
         ? Number(row.verificationRowNumber)
         : Number.isFinite(row?.rowNumber)
         ? Number(row.rowNumber)
         : index + 1,
     }))
-    .filter((row) => String(row?.recipientEmail || "").trim());
+    .filter((row) => !!row.recipientEmail);
 
   if (verificationRows.length === 0) {
     return {
@@ -2441,19 +2460,17 @@ async function processJob(jobId) {
       }
 
       let rows = allRows.slice(0, cfg.maxBatchSize);
-      const requestedVerificationRows = getRequestedVerificationEntries(
-        meta,
-        rows
-      )
+      const requestedVerificationRows = getRequestedVerificationEntries(meta, rows)
         .map((row, index) => ({
           ...row,
+          recipientEmail: getVerificationRowEmail(row),
           verificationRowNumber: Number.isFinite(row?.verificationRowNumber)
             ? Number(row.verificationRowNumber)
             : Number.isFinite(row?.rowNumber)
             ? Number(row.rowNumber)
             : index + 1,
         }))
-        .filter((row) => String(row?.recipientEmail || "").trim());
+        .filter((row) => !!row.recipientEmail);
 
       const verificationControl = getVerificationControl(meta);
       const verificationOnlyBatch = isVerificationOnlyBatch(
@@ -2475,11 +2492,11 @@ async function processJob(jobId) {
 
       if (verificationControl.enabled) {
         if (
-          shouldRunFreshVerification(
-            meta,
-            persistedVerificationState,
-            verificationControl
-          )
+          shouldRunFreshVerification({
+            verificationControl,
+            verificationState: persistedVerificationState,
+            requestedVerificationRows,
+          })
         ) {
           console.log(`[email-verify][${jobId}] Fresh verification run starting.`);
           const verificationRun = await runEmailVerificationStage({
@@ -2578,11 +2595,11 @@ async function processJob(jobId) {
         }
 
         if (
-          shouldWaitForVerificationReview(
+          shouldWaitForVerificationReview({
+            verificationControl,
+            verificationState: persistedVerificationState,
             meta,
-            persistedVerificationState,
-            verificationControl
-          )
+          })
         ) {
           console.log(`[email-verify][${jobId}] Waiting for verification review.`);
           await pushRedisResult(jobId, {
@@ -2613,11 +2630,11 @@ async function processJob(jobId) {
         }
 
         if (
-          shouldResumeAfterVerification(
+          shouldResumeAfterVerification({
+            verificationControl,
+            verificationState: persistedVerificationState,
             meta,
-            persistedVerificationState,
-            verificationControl
-          )
+          })
         ) {
           console.log(`[email-verify][${jobId}] Resume after review.`);
 
