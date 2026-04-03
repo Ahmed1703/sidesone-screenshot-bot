@@ -409,6 +409,7 @@ function getVerificationControl(meta) {
   const verificationMode = String(
     meta?.verificationMode ||
       meta?.emailVerification?.mode ||
+      meta?.verification?.verificationMode ||
       meta?.verification?.mode ||
       "review"
   )
@@ -444,6 +445,8 @@ function isVerificationOnlyBatch(meta, verificationControl = null) {
   return (
     toBoolean(meta?.verificationOnly) ||
     toBoolean(meta?.verifyOnly) ||
+    toBoolean(meta?.verification?.verificationOnly) ||
+    toBoolean(meta?.verification?.verifyOnly) ||
     control.mode === "only"
   );
 }
