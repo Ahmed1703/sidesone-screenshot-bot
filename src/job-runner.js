@@ -594,6 +594,20 @@ function normalizeVerificationIdentityEmail(value) {
   return String(value || "").trim();
 }
 
+function getRequestedVerificationEntries(meta, rows = []) {
+  const metaEntries = Array.isArray(meta?.verification?.entries)
+    ? meta.verification.entries
+    : Array.isArray(meta?.verificationEntries)
+    ? meta.verificationEntries
+    : [];
+
+  if (metaEntries.length) {
+    return metaEntries;
+  }
+
+  return rows;
+}
+
 function buildRequestedVerificationIdentity(row, index = 0) {
   const email = normalizeVerificationIdentityEmail(
     row?.recipientEmail ||
@@ -603,16 +617,14 @@ function buildRequestedVerificationIdentity(row, index = 0) {
       row?.contactEmail
   );
   const normalized = normalizeEmailAddress(email);
-  const rowNumber = Number.isFinite(row?.verificationRowNumber)
-    ? Number(row.verificationRowNumber)
-    : Number.isFinite(row?.rowNumber)
+  const rowNumber = Number.isFinite(row?.rowNumber)
     ? Number(row.rowNumber)
+    : Number.isFinite(row?.verificationRowNumber)
+    ? Number(row.verificationRowNumber)
     : index + 1;
   const rowIndex = Number.isFinite(row?.rowIndex)
     ? Number(row.rowIndex)
-    : Number.isFinite(row?.verificationRowNumber)
-    ? Number(row.verificationRowNumber)
-    : rowNumber;
+    : null;
 
   return {
     email,
@@ -692,12 +704,8 @@ function repairStoredVerificationResult(result, identity) {
     ...repaired,
     email: identity.email || repaired.email,
     normalizedEmail: identity.normalizedEmail || repaired.normalizedEmail,
-    rowNumber: Number.isFinite(result?.rowNumber)
-      ? Number(result.rowNumber)
-      : repaired.rowNumber,
-    rowIndex: Number.isFinite(result?.rowIndex)
-      ? Number(result.rowIndex)
-      : repaired.rowIndex,
+    rowNumber: repaired.rowNumber,
+    rowIndex: repaired.rowIndex,
     status:
       status === "valid" ||
       status === "invalid" ||
@@ -855,10 +863,14 @@ async function runEmailVerificationStage({
   rows,
   queueMetaUpdate,
 }) {
-  const verificationRows = rows
+  const verificationRows = getRequestedVerificationEntries(meta, rows)
     .map((row, index) => ({
       ...row,
-      verificationRowNumber: index + 1,
+      verificationRowNumber: Number.isFinite(row?.verificationRowNumber)
+        ? Number(row.verificationRowNumber)
+        : Number.isFinite(row?.rowNumber)
+        ? Number(row.rowNumber)
+        : index + 1,
     }))
     .filter((row) => String(row?.recipientEmail || "").trim());
 
@@ -2350,10 +2362,17 @@ async function processJob(jobId) {
       }
 
       let rows = allRows.slice(0, cfg.maxBatchSize);
-      const requestedVerificationRows = rows
+      const requestedVerificationRows = getRequestedVerificationEntries(
+        meta,
+        rows
+      )
         .map((row, index) => ({
           ...row,
-          verificationRowNumber: index + 1,
+          verificationRowNumber: Number.isFinite(row?.verificationRowNumber)
+            ? Number(row.verificationRowNumber)
+            : Number.isFinite(row?.rowNumber)
+            ? Number(row.rowNumber)
+            : index + 1,
         }))
         .filter((row) => String(row?.recipientEmail || "").trim());
 
@@ -2412,11 +2431,11 @@ async function processJob(jobId) {
               jobId,
               meta,
               verificationPayload,
-              verificationRows
+              requestedVerificationRows
             );
             existingVerificationResults = normalizeStoredVerificationResults(
               verificationRun.results,
-              verificationRows
+              requestedVerificationRows
             );
 
             if (!meta.verificationCreditsCharged) {
@@ -2511,7 +2530,12 @@ async function processJob(jobId) {
           results: existingVerificationResults,
         };
 
-        await persistVerificationState(jobId, meta, verificationPayload, rows);
+        await persistVerificationState(
+          jobId,
+          meta,
+          verificationPayload,
+          requestedVerificationRows
+        );
       }
 
       meta.total = rows.length;
