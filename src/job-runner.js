@@ -621,6 +621,72 @@ function getRequestedVerificationEntries(meta, rows = []) {
   return rows;
 }
 
+function hasVerificationResults(results) {
+  return Array.isArray(results) && results.length > 0;
+}
+
+function isVerificationReviewCompleted(meta, verificationState) {
+  return (
+    toBoolean(meta?.continueAfterVerification) ||
+    toBoolean(meta?.verificationContinue) ||
+    toBoolean(meta?.verificationReviewCompleted) ||
+    toBoolean(meta?.verification?.reviewCompleted) ||
+    toBoolean(meta?.verification?.approved) ||
+    toBoolean(meta?.emailVerification?.reviewCompleted) ||
+    toBoolean(verificationState?.reviewCompleted) ||
+    toBoolean(verificationState?.approved) ||
+    String(verificationState?.phase || "").trim().toLowerCase() === "completed"
+  );
+}
+
+function getPersistedVerificationState(meta, priorVerificationState) {
+  if (
+    priorVerificationState &&
+    (String(priorVerificationState?.phase || "").trim() ||
+      hasVerificationResults(priorVerificationState?.results))
+  ) {
+    return priorVerificationState;
+  }
+
+  if (
+    meta?.verification &&
+    (String(meta.verification?.phase || "").trim() ||
+      hasVerificationResults(meta.verification?.results))
+  ) {
+    return meta.verification;
+  }
+
+  return null;
+}
+
+function shouldRunFreshVerification(meta, verificationState, verificationControl) {
+  const requestedEntries = getRequestedVerificationEntries(meta, []).filter((row) =>
+    String(row?.recipientEmail || "").trim()
+  );
+
+  return (
+    !!verificationControl?.enabled &&
+    requestedEntries.length > 0 &&
+    !hasVerificationResults(verificationState?.results)
+  );
+}
+
+function shouldWaitForVerificationReview(meta, verificationState, verificationControl) {
+  return (
+    !!verificationControl?.enabled &&
+    hasVerificationResults(verificationState?.results) &&
+    !isVerificationReviewCompleted(meta, verificationState)
+  );
+}
+
+function shouldResumeAfterVerification(meta, verificationState, verificationControl) {
+  return (
+    !!verificationControl?.enabled &&
+    hasVerificationResults(verificationState?.results) &&
+    isVerificationReviewCompleted(meta, verificationState)
+  );
+}
+
 function buildRequestedVerificationIdentity(row, index = 0) {
   const email = normalizeVerificationIdentityEmail(
     row?.recipientEmail ||
@@ -2394,18 +2460,28 @@ async function processJob(jobId) {
         meta,
         verificationControl
       );
-      let existingVerificationResults =
-        meta?.verificationResults || priorVerificationState?.results || [];
-
-      if (verificationControl.enabled && existingVerificationResults.length) {
-        existingVerificationResults = normalizeStoredVerificationResults(
-          existingVerificationResults,
-          requestedVerificationRows
-        );
-      }
+      const persistedVerificationState = getPersistedVerificationState(
+        meta,
+        priorVerificationState
+      );
+      let existingVerificationResults = hasVerificationResults(
+        persistedVerificationState?.results
+      )
+        ? normalizeStoredVerificationResults(
+            persistedVerificationState.results,
+            requestedVerificationRows
+          )
+        : [];
 
       if (verificationControl.enabled) {
-        if (!existingVerificationResults.length) {
+        if (
+          shouldRunFreshVerification(
+            meta,
+            persistedVerificationState,
+            verificationControl
+          )
+        ) {
+          console.log(`[email-verify][${jobId}] Fresh verification run starting.`);
           const verificationRun = await runEmailVerificationStage({
             jobId,
             meta,
@@ -2416,15 +2492,21 @@ async function processJob(jobId) {
           if (verificationRun.stopped) return;
 
           if (verificationRun.noEmails) {
-            await persistVerificationState(jobId, meta, {
-              enabled: true,
-              phase: "completed",
-              type: "batch",
-              provider: "bouncer",
-              checkedAt: verificationRun.checkedAt,
-              summary: verificationRun.summary,
-              results: [],
-            }, []);
+            await persistVerificationState(
+              jobId,
+              meta,
+              {
+                enabled: true,
+                phase: "completed",
+                type: "batch",
+                provider: "bouncer",
+                checkedAt: verificationRun.checkedAt,
+                summary: verificationRun.summary,
+                excludedRowCount: 0,
+                results: [],
+              },
+              []
+            );
             existingVerificationResults = [];
           } else {
             const verificationPayload = {
@@ -2441,6 +2523,7 @@ async function processJob(jobId) {
               providerBatch: verificationRun.providerBatch || null,
               providerCredits: verificationRun.providerCredits || null,
               summary: verificationRun.summary,
+              excludedRowCount: 0,
               results: verificationRun.results,
             };
 
@@ -2471,7 +2554,7 @@ async function processJob(jobId) {
               await persistMeta(jobId, meta);
             }
 
-            console.log(`[email-verify][${jobId}] Verification review required.`);
+            console.log(`[email-verify][${jobId}] Waiting for verification review.`);
             await pushRedisResult(jobId, {
               type: "email_verification",
               status: "verification_review_required",
@@ -2479,7 +2562,7 @@ async function processJob(jobId) {
                 type: "batch",
                 provider: "bouncer",
                 emailColumn: verificationPayload.emailColumn,
-                summary: buildVerificationSummary(existingVerificationResults),
+                summary: buildVerificationSummary(existingVerificationResults, 0),
                 results: existingVerificationResults,
               },
               createdAt: nowIso(),
@@ -2494,8 +2577,14 @@ async function processJob(jobId) {
           }
         }
 
-        if (existingVerificationResults.length && !verificationControl.continueRequested) {
-          console.log(`[email-verify][${jobId}] Verification review required.`);
+        if (
+          shouldWaitForVerificationReview(
+            meta,
+            persistedVerificationState,
+            verificationControl
+          )
+        ) {
+          console.log(`[email-verify][${jobId}] Waiting for verification review.`);
           await pushRedisResult(jobId, {
             type: "email_verification",
             status: "verification_review_required",
@@ -2508,8 +2597,8 @@ async function processJob(jobId) {
                 meta.csvMailColumn ||
                 null,
               summary:
-                priorVerificationState?.summary ||
-                buildVerificationSummary(existingVerificationResults),
+                persistedVerificationState?.summary ||
+                buildVerificationSummary(existingVerificationResults, 0),
               results: existingVerificationResults,
             },
             createdAt: nowIso(),
@@ -2523,61 +2612,71 @@ async function processJob(jobId) {
           return;
         }
 
-        console.log(`[email-verify][${jobId}] Resume after review.`);
-        if (verificationOnlyBatch) {
-          const excludedCount = Math.max(
-            0,
-            Number(meta?.verification?.excludedRowCount) || 0
-          );
-          const verificationPayload = {
-            ...(priorVerificationState || meta.verification || {}),
-            enabled: true,
-            phase: "completed",
-            type: "batch",
-            provider: "bouncer",
-            reviewCompletedAt: nowIso(),
-            excludedRowCount: excludedCount,
-            summary: buildVerificationSummary(
-              existingVerificationResults,
-              excludedCount
-            ),
-            results: existingVerificationResults,
-          };
-
-          await persistVerificationState(
-            jobId,
+        if (
+          shouldResumeAfterVerification(
             meta,
-            verificationPayload,
-            requestedVerificationRows
-          );
+            persistedVerificationState,
+            verificationControl
+          )
+        ) {
+          console.log(`[email-verify][${jobId}] Resume after review.`);
 
-          await pushRedisResult(jobId, {
-            type: "email_verification",
-            status: "completed",
-            verification: {
+          if (verificationOnlyBatch) {
+            const excludedCount = Math.max(
+              0,
+              Number(persistedVerificationState?.excludedRowCount) || 0
+            );
+            const verificationPayload = {
+              ...(persistedVerificationState || meta.verification || {}),
+              enabled: true,
+              phase: "completed",
               type: "batch",
               provider: "bouncer",
-              emailColumn:
-                meta.emailColumn ||
-                meta.mailColumn ||
-                meta.csvMailColumn ||
-                null,
+              reviewCompletedAt: nowIso(),
+              excludedRowCount: Math.max(0, excludedCount),
               summary: buildVerificationSummary(
                 existingVerificationResults,
-                excludedCount
+                Math.max(0, excludedCount)
               ),
               results: existingVerificationResults,
-            },
-            createdAt: nowIso(),
-          });
+            };
 
-          meta.total = existingVerificationResults.length;
-          meta.analyzed = existingVerificationResults.length;
-          meta.failed = 0;
-          meta.status = "completed";
-          clearLiveStep(meta);
-          await persistMeta(jobId, meta);
-          return;
+            await persistVerificationState(
+              jobId,
+              meta,
+              verificationPayload,
+              requestedVerificationRows
+            );
+
+            await pushRedisResult(jobId, {
+              type: "email_verification",
+              status: "completed",
+              verification: {
+                type: "batch",
+                provider: "bouncer",
+                emailColumn:
+                  meta.emailColumn ||
+                  meta.mailColumn ||
+                  meta.csvMailColumn ||
+                  null,
+                summary: buildVerificationSummary(
+                  existingVerificationResults,
+                  Math.max(0, excludedCount)
+                ),
+                results: existingVerificationResults,
+              },
+              createdAt: nowIso(),
+            });
+
+            console.log(`[email-verify][${jobId}] Verification-only batch completed.`);
+            meta.total = existingVerificationResults.length;
+            meta.analyzed = existingVerificationResults.length;
+            meta.failed = 0;
+            meta.status = "completed";
+            clearLiveStep(meta);
+            await persistMeta(jobId, meta);
+            return;
+          }
         }
 
         const isExcluded = buildExcludedRowMatcher(meta, existingVerificationResults);
@@ -2592,16 +2691,16 @@ async function processJob(jobId) {
           existingVerificationResults.length - rows.length
         );
         const verificationPayload = {
-          ...(priorVerificationState || meta.verification || {}),
+          ...(persistedVerificationState || meta.verification || {}),
           enabled: true,
           phase: "completed",
           type: "batch",
           provider: "bouncer",
           reviewCompletedAt: nowIso(),
-          excludedRowCount: excludedCount,
+          excludedRowCount: Math.max(0, excludedCount),
           summary: buildVerificationSummary(
             existingVerificationResults,
-            excludedCount
+            Math.max(0, excludedCount)
           ),
           results: existingVerificationResults,
         };
