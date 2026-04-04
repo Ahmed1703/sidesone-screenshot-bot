@@ -14,10 +14,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up SSH key
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -lf ~/.ssh/id_ed25519 || echo "KEY FINGERPRINT FAILED"
           echo "Host *
             StrictHostKeyChecking no
             UserKnownHostsFile /dev/null" > ~/.ssh/config
