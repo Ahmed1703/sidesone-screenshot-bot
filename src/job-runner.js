@@ -1497,43 +1497,45 @@ function isSheetBatch(meta) {
   return !isCsvBatch(meta) && !!meta?.sheetId;
 }
 
-// Lua script that atomically merges new meta into the stored object while
-// preserving a "paused" or "stopped" status the frontend may have set.
-// This eliminates two race conditions with non-atomic GET-then-SET:
-//   1. Worker writing "running" over a just-set "paused"  → pause is lost
-//   2. Worker writing a stale "paused" over a just-set "running" → stuck
-const MERGE_META_LUA = `
-  local cur = redis.call("GET", KEYS[1])
-  local obj = cjson.decode(ARGV[1])
-  if cur then
-    local old = cjson.decode(cur)
-    local s = old["status"]
-    if s == "paused" or s == "stopped" then
-      obj["status"] = s
-    end
-  end
-  return redis.call("SET", KEYS[1], cjson.encode(obj))`;
-
 async function persistMeta(jobId, meta) {
   meta.updatedAt = nowIso();
   meta.lastHeartbeatAt = nowIso();
 
-  const key = `job:${jobId}:meta`;
-
-  if (meta.status === "running") {
-    await redis.eval(MERGE_META_LUA, [key], [JSON.stringify(meta)]);
-  } else {
-    // Intentional transition (completed, awaiting_verification_review, etc.)
-    await redis.set(key, meta);
+  if (meta.status !== "running") {
+    // Intentional status transition (completed, awaiting_verification_review,
+    // etc.) — write everything including status.
+    await redis.set(`job:${jobId}:meta`, meta);
+    return;
   }
+
+  // During normal "running" operation, read-then-write to preserve any
+  // "paused" / "stopped" the frontend set.  If the user happens to unpause
+  // in the few ms between our GET and SET, the worst case is we write
+  // "paused" back once — waitIfPausedOrStopped will block for one 1.5 s
+  // poll cycle, then the user can unpause again.  This is much better than
+  // the original bug where pause never worked at all.
+  const current = await redis.get(`job:${jobId}:meta`);
+  const remoteStatus = current?.status;
+
+  await redis.set(`job:${jobId}:meta`, {
+    ...meta,
+    status:
+      remoteStatus === "paused" || remoteStatus === "stopped"
+        ? remoteStatus
+        : meta.status,
+  });
 }
 
 async function persistProgressMeta(jobId, meta) {
+  const current = await redis.get(`job:${jobId}:meta`);
+
   meta.updatedAt = nowIso();
   meta.lastHeartbeatAt = nowIso();
 
-  const key = `job:${jobId}:meta`;
-  await redis.eval(MERGE_META_LUA, [key], [JSON.stringify(meta)]);
+  await redis.set(`job:${jobId}:meta`, {
+    ...meta,
+    status: current?.status || meta.status,
+  });
 }
 
 async function markStep(jobId, meta, step, label, extras = {}) {
