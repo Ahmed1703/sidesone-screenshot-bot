@@ -1497,38 +1497,43 @@ function isSheetBatch(meta) {
   return !isCsvBatch(meta) && !!meta?.sheetId;
 }
 
+// Lua script that atomically merges new meta into the stored object while
+// preserving a "paused" or "stopped" status the frontend may have set.
+// This eliminates two race conditions with non-atomic GET-then-SET:
+//   1. Worker writing "running" over a just-set "paused"  → pause is lost
+//   2. Worker writing a stale "paused" over a just-set "running" → stuck
+const MERGE_META_LUA = `
+  local cur = redis.call("GET", KEYS[1])
+  local obj = cjson.decode(ARGV[1])
+  if cur then
+    local old = cjson.decode(cur)
+    local s = old["status"]
+    if s == "paused" or s == "stopped" then
+      obj["status"] = s
+    end
+  end
+  return redis.call("SET", KEYS[1], cjson.encode(obj))`;
+
 async function persistMeta(jobId, meta) {
-  let status = meta.status;
-
-  // When the worker thinks the job is "running", check Redis for an
-  // external "paused" / "stopped" set by the frontend so we don't
-  // accidentally overwrite it back to "running".
-  if (meta.status === "running") {
-    const remoteStatus = (await redis.get(`job:${jobId}:meta`))?.status;
-    if (remoteStatus === "paused" || remoteStatus === "stopped") {
-      status = remoteStatus;
-    }
-  }
-
   meta.updatedAt = nowIso();
   meta.lastHeartbeatAt = nowIso();
 
-  await redis.set(`job:${jobId}:meta`, {
-    ...meta,
-    status,
-  });
+  const key = `job:${jobId}:meta`;
+
+  if (meta.status === "running") {
+    await redis.eval(MERGE_META_LUA, [key], [JSON.stringify(meta)]);
+  } else {
+    // Intentional transition (completed, awaiting_verification_review, etc.)
+    await redis.set(key, meta);
+  }
 }
 
 async function persistProgressMeta(jobId, meta) {
-  const current = await redis.get(`job:${jobId}:meta`);
-
   meta.updatedAt = nowIso();
   meta.lastHeartbeatAt = nowIso();
 
-  await redis.set(`job:${jobId}:meta`, {
-    ...meta,
-    status: current?.status || meta.status,
-  });
+  const key = `job:${jobId}:meta`;
+  await redis.eval(MERGE_META_LUA, [key], [JSON.stringify(meta)]);
 }
 
 async function markStep(jobId, meta, step, label, extras = {}) {
