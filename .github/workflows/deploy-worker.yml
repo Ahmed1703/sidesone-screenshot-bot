@@ -23,6 +23,13 @@ jobs:
             UserKnownHostsFile /dev/null" > ~/.ssh/config
           chmod 600 ~/.ssh/config
 
+      - name: Debug connection info
+        run: |
+          echo "Runner IP: $(curl -s ifconfig.me)"
+          echo "Target port: ${{ secrets.VPS_PORT }}"
+          echo "Target user: ${{ secrets.VPS_USER }}"
+          ssh -vvv -i ~/.ssh/id_ed25519 -p "${{ secrets.VPS_PORT }}" -o ConnectTimeout=15 "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" "echo connected" 2>&1 || true
+
       - name: Ensure worker directory exists
         run: |
           ssh -i ~/.ssh/id_ed25519 -p "${{ secrets.VPS_PORT }}" "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" "mkdir -p /srv/swokei/worker"
