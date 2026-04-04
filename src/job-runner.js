@@ -1500,30 +1500,7 @@ function isSheetBatch(meta) {
 async function persistMeta(jobId, meta) {
   meta.updatedAt = nowIso();
   meta.lastHeartbeatAt = nowIso();
-
-  if (meta.status !== "running") {
-    // Intentional status transition (completed, awaiting_verification_review,
-    // etc.) — write everything including status.
-    await redis.set(`job:${jobId}:meta`, meta);
-    return;
-  }
-
-  // During normal "running" operation, read-then-write to preserve any
-  // "paused" / "stopped" the frontend set.  If the user happens to unpause
-  // in the few ms between our GET and SET, the worst case is we write
-  // "paused" back once — waitIfPausedOrStopped will block for one 1.5 s
-  // poll cycle, then the user can unpause again.  This is much better than
-  // the original bug where pause never worked at all.
-  const current = await redis.get(`job:${jobId}:meta`);
-  const remoteStatus = current?.status;
-
-  await redis.set(`job:${jobId}:meta`, {
-    ...meta,
-    status:
-      remoteStatus === "paused" || remoteStatus === "stopped"
-        ? remoteStatus
-        : meta.status,
-  });
+  await redis.set(`job:${jobId}:meta`, meta);
 }
 
 async function persistProgressMeta(jobId, meta) {
