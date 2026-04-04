@@ -1645,22 +1645,19 @@ async function safeDeleteSheetRow(meta, rowIndex) {
 }
 
 async function waitIfPausedOrStopped(jobId) {
-  while (true) {
-    const freshMeta = await redis.get(`job:${jobId}:meta`);
+  const freshMeta = await redis.get(`job:${jobId}:meta`);
 
-    if (freshMeta?.status === "stopped") {
-      console.log("Job stopped:", jobId);
-      return { stopped: true, meta: freshMeta };
-    }
-
-    if (freshMeta?.status === "paused") {
-      console.log("Job paused:", jobId);
-      await sleep(1500);
-      continue;
-    }
-
-    return { stopped: false, meta: freshMeta };
+  if (freshMeta?.status === "stopped") {
+    console.log("Job stopped:", jobId);
+    return { stopped: true, paused: false, meta: freshMeta };
   }
+
+  if (freshMeta?.status === "paused") {
+    console.log("Job paused, yielding back to queue:", jobId);
+    return { stopped: false, paused: true, meta: freshMeta };
+  }
+
+  return { stopped: false, paused: false, meta: freshMeta };
 }
 
 function buildPromptOverrideFromWriting(basePrompt, writing) {
@@ -1875,7 +1872,7 @@ async function processJob(jobId) {
       console.log("Single job:", meta.siteUrl || "[verification only]");
 
       let gate = await waitIfPausedOrStopped(jobId);
-      if (gate.stopped) return;
+      if (gate.stopped || gate.paused) return;
 
       const verificationControl = getVerificationControl(meta);
       const singleVerificationEmail = extractSingleVerificationEmail(meta);
@@ -2082,7 +2079,7 @@ async function processJob(jobId) {
       console.log("Capture result (single):", meta.siteUrl, captureResult);
 
       gate = await waitIfPausedOrStopped(jobId);
-      if (gate.stopped) return;
+      if (gate.stopped || gate.paused) return;
 
       let scoreResult = null;
       try {
@@ -2121,7 +2118,7 @@ async function processJob(jobId) {
       console.log("Score result (single):", scoreResult);
 
       gate = await waitIfPausedOrStopped(jobId);
-      if (gate.stopped) return;
+      if (gate.stopped || gate.paused) return;
 
       const siteState = classifySiteState(captureResult, scoreResult);
       const scoreValue = normalizeNumericScore(scoreResult?.score);
@@ -2252,7 +2249,7 @@ async function processJob(jobId) {
       }
 
       gate = await waitIfPausedOrStopped(jobId);
-      if (gate.stopped) return;
+      if (gate.stopped || gate.paused) return;
 
       console.log("Qualified single site, starting full AI analysis...");
 
@@ -2299,7 +2296,7 @@ async function processJob(jobId) {
       );
 
       gate = await waitIfPausedOrStopped(jobId);
-      if (gate.stopped) return;
+      if (gate.stopped || gate.paused) return;
 
       const finalPageType =
         analysisResult?.analysis?.page_type ||
@@ -2757,7 +2754,7 @@ async function processJob(jobId) {
 
       for (let start = 0; start < rows.length; start += concurrency) {
         const gate = await waitIfPausedOrStopped(jobId);
-        if (gate.stopped) return;
+        if (gate.stopped || gate.paused) return;
 
         const chunk = rows.slice(start, start + concurrency);
 
@@ -2767,7 +2764,7 @@ async function processJob(jobId) {
 
             try {
               let rowGate = await waitIfPausedOrStopped(jobId);
-              if (rowGate.stopped) return;
+              if (rowGate.stopped || rowGate.paused) return;
 
               console.log(`Processing row ${rowNumber}/${rows.length}:`, row.url);
 
@@ -2825,7 +2822,7 @@ async function processJob(jobId) {
               console.log("Capture result:", row.url, captureResult);
 
               rowGate = await waitIfPausedOrStopped(jobId);
-              if (rowGate.stopped) return;
+              if (rowGate.stopped || rowGate.paused) return;
 
               let scoreResult = null;
               try {
@@ -2874,7 +2871,7 @@ async function processJob(jobId) {
               console.log("Score result:", row.url, scoreResult);
 
               rowGate = await waitIfPausedOrStopped(jobId);
-              if (rowGate.stopped) return;
+              if (rowGate.stopped || rowGate.paused) return;
 
               const siteState = classifySiteState(captureResult, scoreResult);
               const scoreValue = normalizeNumericScore(scoreResult?.score);
@@ -3067,7 +3064,7 @@ async function processJob(jobId) {
               }
 
               rowGate = await waitIfPausedOrStopped(jobId);
-              if (rowGate.stopped) return;
+              if (rowGate.stopped || rowGate.paused) return;
 
               let analysisResult = null;
               try {
@@ -3119,7 +3116,7 @@ async function processJob(jobId) {
               }
 
               rowGate = await waitIfPausedOrStopped(jobId);
-              if (rowGate.stopped) return;
+              if (rowGate.stopped || rowGate.paused) return;
 
               const finalPageType =
                 analysisResult?.analysis?.page_type ||
