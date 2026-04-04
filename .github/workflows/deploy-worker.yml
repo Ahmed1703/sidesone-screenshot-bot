@@ -20,18 +20,10 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keygen -lf ~/.ssh/id_ed25519 || echo "KEY FINGERPRINT FAILED"
           echo "Host *
             StrictHostKeyChecking no
             UserKnownHostsFile /dev/null" > ~/.ssh/config
           chmod 600 ~/.ssh/config
-
-      - name: Debug connection info
-        run: |
-          echo "Runner IP: $(curl -s ifconfig.me)"
-          echo "Target port: ${{ secrets.VPS_PORT }}"
-          echo "Target user: ${{ secrets.VPS_USER }}"
-          ssh -vvv -i ~/.ssh/id_ed25519 -p "${{ secrets.VPS_PORT }}" -o ConnectTimeout=15 "${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}" "echo connected" 2>&1 || true
 
       - name: Ensure worker directory exists
         run: |
