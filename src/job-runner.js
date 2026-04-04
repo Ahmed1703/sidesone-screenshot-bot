@@ -1498,9 +1498,25 @@ function isSheetBatch(meta) {
 }
 
 async function persistMeta(jobId, meta) {
+  let status = meta.status;
+
+  // When the worker thinks the job is "running", check Redis for an
+  // external "paused" / "stopped" set by the frontend so we don't
+  // accidentally overwrite it back to "running".
+  if (meta.status === "running") {
+    const remoteStatus = (await redis.get(`job:${jobId}:meta`))?.status;
+    if (remoteStatus === "paused" || remoteStatus === "stopped") {
+      status = remoteStatus;
+    }
+  }
+
   meta.updatedAt = nowIso();
   meta.lastHeartbeatAt = nowIso();
-  await redis.set(`job:${jobId}:meta`, meta);
+
+  await redis.set(`job:${jobId}:meta`, {
+    ...meta,
+    status,
+  });
 }
 
 async function persistProgressMeta(jobId, meta) {
