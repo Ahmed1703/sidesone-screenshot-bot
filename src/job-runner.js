@@ -1361,7 +1361,7 @@ function getDefaultSystemConfig() {
   return {
     analysis: {
       screenshotMode: "sections",
-      concurrency: 1,
+      concurrency: 3,
       maxBatchSize: 100,
       minScore: 7,
       lowScoreAction: "skip",
