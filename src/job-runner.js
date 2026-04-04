@@ -1524,7 +1524,7 @@ async function markStep(jobId, meta, step, label, extras = {}) {
   meta.currentAttempt = extras.attempt || 1;
   meta.stepStartedAt = nowIso();
   meta.lastStepError = null;
-  await persistMeta(jobId, meta);
+  await persistProgressMeta(jobId, meta);
 }
 
 async function runStep(jobId, meta, options) {
@@ -1556,13 +1556,13 @@ async function runStep(jobId, meta, options) {
 
       meta.lastSuccessfulStep = step;
       meta.lastStepError = null;
-      await persistMeta(jobId, meta);
+      await persistProgressMeta(jobId, meta);
 
       return result;
     } catch (err) {
       lastErr = err;
       meta.lastStepError = safeErrorMessage(err);
-      await persistMeta(jobId, meta);
+      await persistProgressMeta(jobId, meta);
 
       console.warn(
         `[${label}] attempt ${attempt}/${attempts} failed:`,
