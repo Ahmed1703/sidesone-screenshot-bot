@@ -1807,14 +1807,18 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
 
   // --- Recipient context ---
   lines.push("RECIPIENT:");
-  if (recipientFirst) lines.push(`- First name: ${recipientFirst}`);
-  if (recipientCompany) lines.push(`- Company: ${recipientCompany}`);
-  if (recipientUrl) lines.push(`- Website: ${recipientUrl}`);
   if (recipientFirst) {
-    lines.push("Use their first name in the greeting.");
+    lines.push(`- First name: ${recipientFirst}`);
+    lines.push(`YOU MUST start the email with a greeting that includes "${recipientFirst}". Example: "Hei ${recipientFirst}," or "Hi ${recipientFirst},"`);
   } else {
-    lines.push("No first name available — use a generic greeting like \"Hei\" / \"Hi there\".");
+    lines.push("- No first name available.");
+    lines.push("Use a simple generic greeting like \"Hei,\" or \"Hi,\"");
   }
+  if (recipientCompany) {
+    lines.push(`- Company name: ${recipientCompany}`);
+    lines.push(`Reference "${recipientCompany}" naturally in the email body — for example when talking about their website.`);
+  }
+  if (recipientUrl) lines.push(`- Website: ${recipientUrl}`);
   lines.push("");
 
   // --- Sender context ---
@@ -1822,18 +1826,25 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
     lines.push("SENDER (you — the person writing this email):");
     if (senderName) lines.push(`- Your name: ${senderName}`);
     if (senderCompany) lines.push(`- Your company: ${senderCompany}`);
-    lines.push("Introduce yourself naturally in the opening. Keep it brief — one short line, not a paragraph.");
+    if (senderName && senderCompany) {
+      lines.push(`YOU MUST introduce yourself in the opening. Example: "Jeg heter ${senderName} og jobber i ${senderCompany}" or "I'm ${senderName} from ${senderCompany}".`);
+    } else if (senderName) {
+      lines.push(`YOU MUST introduce yourself in the opening. Example: "Mitt navn er ${senderName}" or "I'm ${senderName}".`);
+    } else {
+      lines.push(`YOU MUST mention your company in the opening. Example: "Jeg tar kontakt fra ${senderCompany}" or "I'm reaching out from ${senderCompany}".`);
+    }
+    lines.push(`Sign off at the end with just: ${senderName || senderCompany}`);
     lines.push("");
   }
 
   // --- Email structure ---
   lines.push(
-    "EMAIL STRUCTURE:",
-    "1. GREETING — Natural, using recipient's first name if available. Vary it — don't always use the exact same greeting.",
-    "2. OPENING — Why you're reaching out. You came across their website. If sender info is provided, weave in a brief intro of who you are.",
-    "3. CRITIQUE — This is the core. Specific observations about their website based on the structured analysis provided. Reference concrete visible elements (menu, hero section, fonts, spacing, buttons, contact form, footer, images). This must feel like you actually looked at their site, not a generic template.",
-    "4. CLOSING — Smooth transition from the critique into the closing goal. Must feel natural, not abrupt.",
-    `5. SIGN-OFF — Just ${senderName || "your first name"}. Nothing formal. No \"Best regards\", no \"Med vennlig hilsen\", no \"Mvh\".`,
+    "EMAIL STRUCTURE (follow this order):",
+    "1. GREETING — Use the recipient's first name if provided above. Just the greeting line, then a line break.",
+    "2. OPENING — 1-2 sentences about how you came across their website. If SENDER info is provided above, introduce yourself here. Vary how you say it — don't always say \"I came across your website\". Try things like \"I was looking at sites in [their industry]\" or \"Your site caught my eye\" or \"I ended up on your site while browsing\".",
+    "3. CRITIQUE — The core of the email. 2-5 sentences of specific observations about their website. Reference real page elements from the structured analysis. This is what makes the email credible — the reader should think you actually visited their site.",
+    "4. CLOSING — 1-2 sentences. Smooth natural transition from the critique into the closing goal described above. Not abrupt. Not salesy.",
+    `5. SIGN-OFF — Just "${senderName || "your name"}" on its own line. Nothing else. No "Best regards", no "Med vennlig hilsen", no "Mvh", no title.`,
     ""
   );
 
@@ -1870,9 +1881,11 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
 
   // --- Norwegian language directive ---
   if (isNorwegian) {
-    lines.push(
+    lines.splice(
+      1,
+      0,
       "",
-      "LANGUAGE: Write the entire email in Norwegian (Bokmål). Do not use English words or phrases."
+      "ABSOLUTT SPRÅKREGEL: Hele e-posten SKAL skrives på norsk (Bokmål). IKKE bruk engelske ord eller fraser. Hilsenen skal være på norsk (\"Hei\", ikke \"Hi\"). Avslutningen skal være på norsk. Alt skal være på norsk."
     );
   }
 

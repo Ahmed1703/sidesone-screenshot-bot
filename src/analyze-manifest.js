@@ -1397,14 +1397,16 @@ async function runWritingPass({
       model,
       temperature: 0.7,
       instructions:
-        `You are writing a complete outreach email in ${outputLanguageName}. ` +
-        `Every word must be in ${outputLanguageName}. Never mix languages. ` +
-        `Follow the provided writing rules exactly — they contain the full email structure, tone, length, recipient info, sender info, and closing goal. ` +
-        `Use the structured website analysis as the factual basis for the critique section. ` +
-        `Do not invent observations. Only reference what the structured analysis supports. ` +
-        `Use simple everyday language. No designer jargon. No consultant speak. ` +
-        `Sound like a real person, not a template. Each email should feel unique. ` +
-        `Do not mention screenshots, AI, or any analysis tool. ` +
+        `You are writing a complete outreach email. ` +
+        `LANGUAGE RULE — THIS IS ABSOLUTE: Every single word in the email must be in ${outputLanguageName}. ` +
+        `The greeting must be in ${outputLanguageName}. The closing must be in ${outputLanguageName}. The sign-off must be in ${outputLanguageName}. ` +
+        `Do NOT mix languages. Do NOT use English words if the language is not English. ` +
+        `For example, if writing in Norwegian: "Hei" not "Hi", "Hei der" not "Hei there", "nettsiden" not "website". ` +
+        `Follow the WRITING RULES exactly — they specify the recipient name, sender name, tone, structure, and closing goal. ` +
+        `If the rules provide a SENDER section with a name and company, you MUST introduce yourself using that name and company in the opening. This is not optional. ` +
+        `If the rules provide a RECIPIENT section with a first name, you MUST use that name in the greeting. ` +
+        `Use the structured website analysis as the factual basis for the critique. Do not invent observations. ` +
+        `Sound like a real human, not a template. Vary your phrasing. ` +
         `Return plain text only. No HTML. No markdown. No subject line.`,
       input: [
         {
@@ -1421,12 +1423,18 @@ async function runWritingPass({
                   2
                 )}\n` +
                 `
-Write the complete email now.
-Follow the WRITING RULES exactly — they define the structure (greeting, opening, critique, closing, sign-off).
-Base the critique section on the WEBSITE ANALYSIS facts above.
-Prefer specific visible details over generic statements.
-Vary your phrasing — do not sound formulaic or repetitive.
-Write everything in ${outputLanguageName}.`,
+Write the complete email now. Follow the WRITING RULES exactly.
+
+CHECKLIST — verify before returning:
+- Is the greeting in ${outputLanguageName}? (e.g. "Hei [name]" for Norwegian, not "Hi [name]")
+- Did you use the recipient's first name in the greeting (if provided in RECIPIENT section)?
+- Did you introduce yourself with sender name and company (if provided in SENDER section)?
+- Is every word in ${outputLanguageName}? No English words mixed in?
+- Did you reference specific website elements from the analysis?
+- Does the closing match the CLOSING GOAL from the rules?
+- Did you sign off with just the sender's first name?
+
+Write the email now. Every word in ${outputLanguageName}.`,
             },
           ],
         },
@@ -1467,8 +1475,14 @@ async function analyzeWithAI(
   const screenshotMode = getCurrentScreenshotMode();
   const imagePaths = getImagePathsForMode(manifest);
 
-  const isEnglish = String(languageArg || "no").toLowerCase() === "en";
-  const outputLanguageName = isEnglish ? "English" : "Norwegian Bokmål";
+  const langCode = String(languageArg || "no").toLowerCase();
+  const outputLanguageNames = {
+    en: "English", no: "Norwegian Bokmål", sv: "Swedish", da: "Danish",
+    de: "German", fr: "French", es: "Spanish", nl: "Dutch",
+    fi: "Finnish", pt: "Portuguese", it: "Italian", pl: "Polish",
+  };
+  const isEnglish = langCode === "en";
+  const outputLanguageName = outputLanguageNames[langCode] || "Norwegian Bokmål";
 
   const prompt =
     String(promptOverride || "").trim() ||
