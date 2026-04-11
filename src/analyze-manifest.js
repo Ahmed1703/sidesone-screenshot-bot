@@ -1390,41 +1390,22 @@ async function runWritingPass({
   outputLanguageName,
   prompt,
   writingStructured,
-  strictSpecificity = false,
 }) {
-  const strictBlock = strictSpecificity
-    ? `
-
-STRICT SPECIFICITY MODE:
-- Mention 2 to 4 concrete visible observations if the structured facts support them.
-- Preserve specific page areas from the structured facts: top line navigation, menu, icon row, buttons, contact form, footer, text blocks, section spacing, images, script font, dark background, or similar.
-- Do not collapse concrete observations into vague wording like "could be more polished" or "room for improvement".
-- Do not write a bland summary.`
-    : "";
-
   const commentResponse = await createOpenAIResponse(
     client,
     {
       model,
-      temperature: strictSpecificity ? 0.3 : 0.45,
+      temperature: 0.7,
       instructions:
-        `You are writing the final requested outreach output in ${outputLanguageName}. ` +
-        `Every sentence must be written only in ${outputLanguageName}. ` +
-        `Never mix languages. ` +
-        `If ${outputLanguageName} is Norwegian Bokmål, do not write English. ` +
-        `If ${outputLanguageName} is English, do not write Norwegian. ` +
-        `Follow the provided style rules exactly. ` +
-        `Use only the structured analysis and evidence provided. ` +
-        `Do not invent positives. ` +
-        `If there is no clear positive, begin with a neutral factual observation instead. ` +
-        `Write like a short visual audit, not a summary of what the company offers. ` +
-        `Use simple everyday language, not designer or consultant wording. ` +
-        `Avoid generic filler like "could be more polished", "room for improvement", "feel smoother", or "stronger visually" unless tied to something concrete. ` +
-        `Prefer specific visible page areas when supported by evidence. ` +
-        `Do not mention screenshots, AI, or technical limitations. ` +
-        `When the rules say this text is inserted between an already-written intro and outro, write ONLY the middle critique section. ` +
-        `Do not greet. Do not introduce yourself. Do not say you looked at the website. Do not add a CTA. Do not add a closing line. ` +
-        `Return plain text only.`,
+        `You are writing a complete outreach email in ${outputLanguageName}. ` +
+        `Every word must be in ${outputLanguageName}. Never mix languages. ` +
+        `Follow the provided writing rules exactly — they contain the full email structure, tone, length, recipient info, sender info, and closing goal. ` +
+        `Use the structured website analysis as the factual basis for the critique section. ` +
+        `Do not invent observations. Only reference what the structured analysis supports. ` +
+        `Use simple everyday language. No designer jargon. No consultant speak. ` +
+        `Sound like a real person, not a template. Each email should feel unique. ` +
+        `Do not mention screenshots, AI, or any analysis tool. ` +
+        `Return plain text only. No HTML. No markdown. No subject line.`,
       input: [
         {
           role: "user",
@@ -1432,37 +1413,28 @@ STRICT SPECIFICITY MODE:
             {
               type: "input_text",
               text:
-                `WRITING STYLE RULES:\n${prompt}\n\n` +
-                `LANGUAGE REQUIRED:\n${outputLanguageName}\n\n` +
-                `STRUCTURED FACTS THAT MUST BE FOLLOWED:\n${JSON.stringify(
+                `WRITING RULES:\n${prompt}\n\n` +
+                `LANGUAGE: ${outputLanguageName}\n\n` +
+                `WEBSITE ANALYSIS (use these facts for the critique section):\n${JSON.stringify(
                   writingStructured,
                   null,
                   2
                 )}\n` +
-                strictBlock +
                 `
-
-Write the requested output now.
-Follow the WRITING STYLE RULES exactly.
-The output must be ONLY the middle critique section of an email when the rules say it is inserted between intro and outro.
-Do not restart the email.
-Do not greet.
-Do not introduce yourself.
-Do not say you looked at the website.
-Do not add a closing line or CTA.
-Start directly with the critique itself.
-Use the exact structured evidence whenever possible.
-Prefer concrete details over vague wording.
-Write the full output only in ${outputLanguageName}.
-Never mix languages.`,
+Write the complete email now.
+Follow the WRITING RULES exactly — they define the structure (greeting, opening, critique, closing, sign-off).
+Base the critique section on the WEBSITE ANALYSIS facts above.
+Prefer specific visible details over generic statements.
+Vary your phrasing — do not sound formulaic or repetitive.
+Write everything in ${outputLanguageName}.`,
             },
           ],
         },
       ],
-      max_output_tokens: 340,
+      max_output_tokens: 600,
     },
     OPENAI_WRITE_TIMEOUT_MS,
-    strictSpecificity ? "OpenAI writing retry" : "OpenAI writing"
+    "OpenAI full email"
   );
 
   return cleanGeneratedText(normalizeComment(extractTextFromResponse(commentResponse)));
@@ -1646,7 +1618,6 @@ async function analyzeWithAI(
       outputLanguageName,
       prompt,
       writingStructured,
-      strictSpecificity: false,
     });
 
     rawText = cleanGeneratedText(rawText);
@@ -1654,17 +1625,7 @@ async function analyzeWithAI(
     rawText = "";
   }
 
-  if (
-    !rawText ||
-    shouldRetrySpecificRewrite(rawText, writingStructured) ||
-    isWrongLanguage(rawText, languageArg)
-  ) {
-    rawText = buildDeterministicStructuredComment(writingStructured, languageArg);
-  }
-
-  rawText = stripLowScoreFlattery(rawText, writingStructured, languageArg);
-
-  if (isWrongLanguage(rawText, languageArg)) {
+  if (!rawText) {
     rawText = buildDeterministicStructuredComment(writingStructured, languageArg);
   }
 

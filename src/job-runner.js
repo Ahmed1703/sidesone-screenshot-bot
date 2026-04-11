@@ -1361,89 +1361,7 @@ function getDefaultFallbackComment(language) {
 
 
 
-function removeRepeatedPrefix(text, prefix) {
-  const value = String(text || "").trim();
-  const p = String(prefix || "").trim();
 
-  if (!value || !p) return value;
-
-  const lowerValue = value.toLowerCase();
-  const lowerPrefix = p.toLowerCase();
-
-  if (lowerValue.startsWith(lowerPrefix)) {
-    return value.slice(p.length).trim();
-  }
-
-  return value;
-}
-
-function sanitizeGeneratedMiddleSection(text, writing) {
-  let value = String(text || "").replace(/\r/g, "").trim();
-  if (!value) return value;
-
-  const intro = safeString(writing?.opening, 4000).trim();
-  const outro = safeString(writing?.closing, 4000).trim();
-  const isEnglish = writing?.language === "en";
-
-  value = removeRepeatedPrefix(value, intro);
-  value = removeRepeatedPrefix(value, outro);
-
-  const lines = value
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  value = lines.join(" ").replace(/\s+/g, " ").trim();
-
-  const startPatterns = isEnglish
-    ? [
-        /^hi[\s,!.-]*/i,
-        /^hello[\s,!.-]*/i,
-        /^hey[\s,!.-]*/i,
-        /^i took a quick look[^.?!]*[.?!]?\s*/i,
-        /^i took a look[^.?!]*[.?!]?\s*/i,
-        /^i checked your website[^.?!]*[.?!]?\s*/i,
-        /^i looked at your website[^.?!]*[.?!]?\s*/i,
-        /^i noticed that\s*/i,
-      ]
-    : [
-        /^hei[\s,!.-]*/i,
-        /^hallo[\s,!.-]*/i,
-        /^jeg tok en (rask |kjapp )?titt[^.?!]*[.?!]?\s*/i,
-        /^jeg så på nettsiden[^.?!]*[.?!]?\s*/i,
-        /^jeg la merke til at\s*/i,
-      ];
-
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const pattern of startPatterns) {
-      const next = value.replace(pattern, "").trim();
-      if (next !== value) {
-        value = next;
-        changed = true;
-      }
-    }
-  }
-
-  const endPatterns = isEnglish
-    ? [
-        /\s*happy to share[^.?!]*[.?!]?$/i,
-        /\s*let me know if you want[^.?!]*[.?!]?$/i,
-        /\s*if you want,? i can[^.?!]*[.?!]?$/i,
-      ]
-    : [
-        /\s*jeg kan gjerne vise[^.?!]*[.?!]?$/i,
-        /\s*hvis du vil,? kan jeg[^.?!]*[.?!]?$/i,
-      ];
-
-  for (const pattern of endPatterns) {
-    value = value.replace(pattern, "").trim();
-  }
-
-  value = value.replace(/\s+/g, " ").trim();
-  return value;
-}
 
 function pickBestGeneratedComment(analysisResult) {
   const candidates = [
@@ -1461,13 +1379,9 @@ function pickBestGeneratedComment(analysisResult) {
   return "";
 }
 
-function finalizeGeneratedComment(analysisResult, writing, language) {
+function finalizeGeneratedComment(analysisResult, _writing, language) {
   const rawBest = pickBestGeneratedComment(analysisResult);
-  const sanitized = sanitizeGeneratedMiddleSection(rawBest, writing).trim();
-
-  if (sanitized) return sanitized;
   if (rawBest) return rawBest.trim();
-
   return getDefaultFallbackComment(language);
 }
 
@@ -1824,13 +1738,9 @@ async function waitIfPausedOrStopped(jobId) {
   return { stopped: false, paused: false, meta: freshMeta };
 }
 
-function buildPromptOverrideFromWriting(basePrompt, writing) {
+function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
   const lang = writing.language || "no";
   const isNorwegian = lang === "no";
-
-  // For Norwegian we keep native instructions; all others use English instructions
-  // with a language directive to produce output in the target language.
-  const t = (en, no) => (isNorwegian ? no : en);
 
   const languageNames = {
     en: "English", no: "Norwegian", sv: "Swedish", da: "Danish",
@@ -1838,188 +1748,135 @@ function buildPromptOverrideFromWriting(basePrompt, writing) {
     fi: "Finnish", pt: "Portuguese", it: "Italian", pl: "Polish",
   };
 
-  const intro = safeString(writing.opening, 4000).trim();
-  const outro = safeString(writing.closing, 4000).trim();
-
   const senderName = String(writing.senderName || "").trim();
   const senderCompany = String(writing.senderCompany || "").trim();
+  const recipientFirst = String(leadData.firstName || "").trim();
+  const recipientCompany = String(leadData.companyName || "").trim();
+  const recipientUrl = String(leadData.url || "").trim();
 
-  let defaultIntro;
-  if (writing.includeNameCompany && (senderName || senderCompany)) {
-    if (senderName && senderCompany) {
-      defaultIntro = t(
-        `Hi, I'm ${senderName} from ${senderCompany}. I took a quick look through your website and noticed that`,
-        `Hei, jeg heter ${senderName} og jobber i ${senderCompany}. Jeg tok en rask titt på nettsiden deres og la merke til at`
-      );
-    } else if (senderName) {
-      defaultIntro = t(
-        `Hi, I'm ${senderName}. I took a quick look through your website and noticed that`,
-        `Hei, jeg heter ${senderName}. Jeg tok en rask titt på nettsiden deres og la merke til at`
-      );
-    } else {
-      defaultIntro = t(
-        `Hi, I'm reaching out from ${senderCompany}. I took a quick look through your website and noticed that`,
-        `Hei, jeg tar kontakt fra ${senderCompany}. Jeg tok en rask titt på nettsiden deres og la merke til at`
-      );
-    }
-  } else {
-    defaultIntro = t(
-      "I took a quick look through your website and noticed that",
-      "Jeg tok en rask titt på nettsiden deres og la merke til at"
-    );
-  }
-
-  const defaultOutro = t(
-    "Happy to share a few ideas if helpful.",
-    "Jeg kan gjerne vise noen enkle ideer om det er interessant."
-  );
-
+  // --- Tone ---
   const toneMap = {
-    professional: t(
-      "Sound professional, calm, credible, and observant.",
-      "Vær profesjonell, rolig, troverdig og observant."
-    ),
-    friendly: t(
-      "Sound friendly, natural, warm, and easy to read.",
-      "Vær vennlig, naturlig, varm og lett å lese."
-    ),
-    direct: t(
-      "Sound direct, clear, and confident, but still polite.",
-      "Vær direkte, tydelig og trygg, men fortsatt høflig."
-    ),
-    sales: t(
-      "Sound commercially sharp, but never pushy, cheesy, or scripted.",
-      "Vær kommersielt skarp, men aldri pushy, cheesy eller innøvd."
-    ),
-    soft: t(
-      "Sound softer, gentler, and less harsh in the criticism.",
-      "Vær mildere, mykere og mindre hard i kritikken."
-    ),
+    professional: "Professional, calm, credible, and observant. Like a skilled expert casually pointing out what they noticed.",
+    friendly: "Friendly, warm, natural, and easy to read. Like texting a colleague you respect.",
+    direct: "Direct, clear, and confident. No fluff, but still polite. Get to the point fast.",
+    sales: "Commercially sharp but never pushy or scripted. Confident about the value you bring, without overselling.",
+    soft: "Gentle and encouraging. Point out issues without making it feel like criticism. More like helpful advice from a friend.",
   };
 
+  // --- Length (for full email including greeting + critique + closing) ---
   const lengthMap = {
-    one_sentence: t(
-      "Write exactly 1 short sentence.",
-      "Skriv nøyaktig 1 kort setning."
-    ),
-    two_sentences: t(
-      "Write exactly 2 short sentences.",
-      "Skriv nøyaktig 2 korte setninger."
-    ),
-    short_paragraph: t(
-      "Write 3 to 4 short sentences.",
-      "Skriv 3 til 4 korte setninger."
-    ),
-    medium_paragraph: t(
-      "Write 4 to 6 short sentences.",
-      "Skriv 4 til 6 korte setninger."
-    ),
+    one_sentence: "Write an extremely brief email. Around 3-4 sentences total. Greeting, one sharp observation, and a short closing.",
+    two_sentences: "Write a short email. Around 4-6 sentences total. Greeting, two observations, and a closing.",
+    short_paragraph: "Write a normal-length email. Around 6-9 sentences total. Natural greeting, 3-4 critique sentences, smooth closing.",
+    medium_paragraph: "Write a detailed email. Around 9-12 sentences total. Warm greeting, 4-6 critique sentences with specifics, thoughtful closing.",
   };
 
+  // --- Closing goal ---
   const goalMap = {
-    free_mockup: t(
-      "The goal of this email is to offer a free mockup or redesign sample. The closing should naturally lead toward that offer.",
-      "Målet med denne e-posten er å tilby en gratis mockup eller redesign-prøve. Avslutningen skal naturlig lede mot det tilbudet."
-    ),
-    discovery_call: t(
-      "The goal of this email is to book a short discovery call. The closing should naturally lead toward scheduling a brief conversation.",
-      "Målet med denne e-posten er å booke en kort samtale. Avslutningen skal naturlig lede mot å avtale en kort prat."
-    ),
-    start_conversation: t(
-      "The goal of this email is to start a casual conversation. The closing should feel low-pressure and open-ended.",
-      "Målet med denne e-posten er å starte en uformell samtale. Avslutningen skal føles lavterskel og åpen."
-    ),
+    free_mockup:
+      "CLOSING GOAL: Offer to build a free mockup or redesign sample. " +
+      "Transition naturally from the critique into something like: based on what I saw, I put together a quick idea of how your site could look — or offer to do so. " +
+      "Make it feel like a gift, not a pitch. The reader should feel curious, not pressured.",
+    discovery_call:
+      "CLOSING GOAL: Suggest a short call to discuss. " +
+      "Transition naturally from the critique into offering a brief conversation — something like: happy to walk you through a few ideas if you have 10 minutes this week. " +
+      "Keep it casual and low-commitment.",
+    start_conversation:
+      "CLOSING GOAL: Start a casual conversation. " +
+      "End with something open-ended and low-pressure — like: let me know if any of this resonates, or if you've already been thinking about updating the site. " +
+      "No hard ask. Just leave the door open.",
   };
 
-  const personalisationRule = writing.includeNameCompany
-    ? t(
-        "If the lead's first name or company name is available in the context, weave it naturally into the critique. Do NOT force it if it sounds awkward.",
-        "Hvis ledens fornavn eller firmanavn er tilgjengelig i konteksten, flett det naturlig inn i kommentaren. Ikke tving det inn hvis det høres unaturlig ut."
-      )
-    : t(
-        "Do NOT use the lead's first name or company name in the output. Keep it generic.",
-        "IKKE bruk ledens fornavn eller firmanavn i teksten. Hold det generisk."
-      );
-
+  // --- Build the prompt ---
   const lines = [
     String(basePrompt || "").trim(),
     "",
-    t("JOB RULES:", "JOBBREGLER:"),
+    "=== FULL EMAIL GENERATION ===",
+    "Write a COMPLETE outreach email from greeting to sign-off. Not just a section — the entire email.",
+    "First person singular only. Always say \"I\", never \"we\" or \"our team\".",
+    "",
+    "TONE:",
     toneMap[writing.tone] || toneMap.professional,
+    "",
+    "LENGTH:",
     lengthMap[writing.outputLength] || lengthMap.short_paragraph,
+    "",
     goalMap[writing.initialGoal] || goalMap.start_conversation,
-    personalisationRule,
     "",
-    t(
-      "Write ONLY the critique section that goes between an already-written intro and an already-written outro.",
-      "Skriv KUN selve kommentardelen som skal stå mellom en allerede skrevet åpning og en allerede skrevet avslutning."
-    ),
-    t(
-      "Do NOT greet. Do NOT introduce yourself. Do NOT say you looked at the site. Do NOT sign off. Do NOT add a CTA.",
-      "Ikke hils. Ikke introduser deg selv. Ikke skriv at du har sett på nettsiden. Ikke signer av. Ikke legg til CTA."
-    ),
-    t(
-      "Do NOT restart the email. Do NOT repeat the intro. Do NOT repeat the outro.",
-      "Ikke start e-posten på nytt. Ikke gjenta åpningen. Ikke gjenta avslutningen."
-    ),
-    t(
-      "Start immediately with the actual critique.",
-      "Start direkte med selve kommentaren."
-    ),
-    t(
-      "Your output must sound like the middle of an email, not the beginning or the ending.",
-      "Outputen må høres ut som midten av en e-post, ikke starten eller slutten."
-    ),
-    t(
-      "Never begin with phrases like: I took a quick look, I checked your website, I noticed that, Hi, Hello.",
-      "Begynn aldri med fraser som: Jeg tok en titt, Jeg så på nettsiden, Jeg la merke til at, Hei, Hallo."
-    ),
-    t(
-      "Avoid vague filler like: the site works, could be more polished, room for improvement, a bit more spacing would help, unless tied to a specific visible element.",
-      "Unngå vag fylltekst som: nettsiden fungerer, kunne vært mer polert, rom for forbedring, litt mer luft ville hjulpet, med mindre det knyttes til et konkret synlig element."
-    ),
-    t(
-      "Prefer concrete visible details such as contact form length, font readability, menu density, weak button visibility, heavy footer, dark background, cramped sections, isolated image/video block, dense text blocks, or awkward spacing.",
-      "Foretrekk konkrete synlige detaljer som lengden på kontaktskjema, lesbarhet i font, tett meny, svak knappesynlighet, tung footer, mørk bakgrunn, trange seksjoner, isolert bilde-/videoblokk, tette tekstblokker eller svak spacing."
-    ),
-    "",
-    t("INTRO ALREADY WRITTEN:", "ÅPNING SOM ALLEREDE ER SKREVET:"),
-    intro || defaultIntro,
-    "",
-    t("OUTRO ALREADY WRITTEN:", "AVSLUTNING SOM ALLEREDE ER SKREVET:"),
-    outro || defaultOutro,
-    "",
-    t("Return plain text only.", "Returner kun ren tekst."),
   ];
 
-  // For non-English, non-Norwegian languages: add a language directive at the top
+  // --- Recipient context ---
+  lines.push("RECIPIENT:");
+  if (recipientFirst) lines.push(`- First name: ${recipientFirst}`);
+  if (recipientCompany) lines.push(`- Company: ${recipientCompany}`);
+  if (recipientUrl) lines.push(`- Website: ${recipientUrl}`);
+  if (recipientFirst) {
+    lines.push("Use their first name in the greeting.");
+  } else {
+    lines.push("No first name available — use a generic greeting like \"Hei\" / \"Hi there\".");
+  }
+  lines.push("");
+
+  // --- Sender context ---
+  if (writing.includeNameCompany && (senderName || senderCompany)) {
+    lines.push("SENDER (you — the person writing this email):");
+    if (senderName) lines.push(`- Your name: ${senderName}`);
+    if (senderCompany) lines.push(`- Your company: ${senderCompany}`);
+    lines.push("Introduce yourself naturally in the opening. Keep it brief — one short line, not a paragraph.");
+    lines.push("");
+  }
+
+  // --- Email structure ---
+  lines.push(
+    "EMAIL STRUCTURE:",
+    "1. GREETING — Natural, using recipient's first name if available. Vary it — don't always use the exact same greeting.",
+    "2. OPENING — Why you're reaching out. You came across their website. If sender info is provided, weave in a brief intro of who you are.",
+    "3. CRITIQUE — This is the core. Specific observations about their website based on the structured analysis provided. Reference concrete visible elements (menu, hero section, fonts, spacing, buttons, contact form, footer, images). This must feel like you actually looked at their site, not a generic template.",
+    "4. CLOSING — Smooth transition from the critique into the closing goal. Must feel natural, not abrupt.",
+    `5. SIGN-OFF — Just ${senderName || "your first name"}. Nothing formal. No \"Best regards\", no \"Med vennlig hilsen\", no \"Mvh\".`,
+    ""
+  );
+
+  // --- Human writing rules ---
+  lines.push(
+    "WRITING RULES — THIS IS CRITICAL:",
+    "- Sound like a real person who genuinely looked at their website and has something useful to say.",
+    "- Every email must feel individually written. Vary your phrasing, sentence structure, and transitions.",
+    "- Use contractions in English (I'm, you'll, it's, don't). In Norwegian, write naturally and informally (du/dere).",
+    "- Keep paragraphs short. 2-3 sentences max per paragraph. Use line breaks between paragraphs.",
+    "- No bullet points. No numbered lists. Just flowing conversational text.",
+    "- NEVER use these clichés: \"I hope this email finds you well\", \"Don't hesitate to reach out\", \"Looking forward to hearing from you\", \"I hope you're doing well\", \"I wanted to reach out\", \"I'm reaching out because\".",
+    "- NEVER use vague filler: \"room for improvement\", \"could be more polished\", \"feel smoother\", \"stronger visually\", \"a few tweaks\" — unless tied to a specific visible element.",
+    "- NEVER say \"I/we noticed\" as the first words after the greeting. Vary how you bring up the website.",
+    "- Prefer concrete details: a cramped contact form, a hard-to-read font, buttons that blend into the background, a footer that feels heavier than the main content, dense text blocks with no breathing room, a hero section with no clear call to action.",
+    "- Do not mention screenshots, AI, analysis tools, or any technical process. You simply looked at their website.",
+    "- Do not sound like a consultant or designer using jargon. Use everyday words a business owner would understand.",
+    "- Do not summarize what the company does. You're critiquing the website design, not their business.",
+    "- The email should make the reader think: \"This person actually looked at my site and knows what they're talking about.\"",
+    "",
+    "Return plain text only. No HTML. No markdown. No subject line.",
+  );
+
+  // --- Language directive for non-English, non-Norwegian ---
   if (!isNorwegian && lang !== "en") {
     const langName = languageNames[lang] || lang;
     lines.splice(
       1,
       0,
       "",
-      `IMPORTANT: Write your ENTIRE output in ${langName}. Every word must be in ${langName}.`
+      `IMPORTANT: Write the ENTIRE email in ${langName}. Every word — greeting, critique, closing, sign-off — must be in ${langName}.`
     );
   }
 
-  const prompt = lines.filter(Boolean).join("\n");
-
-  if (writing.includeNameCompany && (senderName || senderCompany)) {
-    let senderCtx = t(
-      "\n\nSENDER CONTEXT (the person sending this email):",
-      "\n\nAVSENDER-KONTEKST (personen som sender denne e-posten):"
+  // --- Norwegian language directive ---
+  if (isNorwegian) {
+    lines.push(
+      "",
+      "LANGUAGE: Write the entire email in Norwegian (Bokmål). Do not use English words or phrases."
     );
-    if (senderName) senderCtx += `\n- ${t("Name", "Navn")}: ${senderName}`;
-    if (senderCompany) senderCtx += `\n- ${t("Company", "Firma")}: ${senderCompany}`;
-    senderCtx += "\n" + t(
-      "Include a natural introduction using this name/company in the email opening.",
-      "Inkluder en naturlig introduksjon med dette navnet/firmaet i e-poståpningen."
-    );
-    return prompt + senderCtx;
   }
 
-  return prompt;
+  return lines.filter(Boolean).join("\n");
 }
 
 function getUnreachableOutcome(cfg, analysisLanguage) {
@@ -2683,26 +2540,10 @@ async function processJob(jobId) {
         );
       }
 
-      // Assemble full email for single mode
-      const singleLeadTokens = {
-        url: meta.siteUrl || "",
-        website: meta.siteUrl || "",
-        firstName: "",
-        firstname: "",
-        company: "",
-        companyName: "",
-        email: "",
-      };
-      const resolvedOpening = resolveEmailSubject(writing.opening || "", singleLeadTokens);
-      const resolvedClosing = resolveEmailSubject(writing.closing || "", singleLeadTokens);
-      const fullEmail = [resolvedOpening, comment, resolvedClosing]
-        .filter(Boolean)
-        .join("\n\n");
-
       meta.singleAnalysisPayload = analysisPayload;
       await persistMeta(jobId, meta);
 
-      console.log("Final extracted comment:", fullEmail);
+      console.log("Final extracted comment:", comment);
 
       await consumeAnalysisCredit({
         appUserId: meta.appUserId,
@@ -2716,9 +2557,9 @@ async function processJob(jobId) {
 
       await pushRedisResult(jobId, {
         url: meta.siteUrl,
-        comment: fullEmail,
-        body: fullEmail,
-        email_body: fullEmail,
+        comment,
+        body: comment,
+        email_body: comment,
         emailSubject: singleEmailSubject,
         status: finalStatus,
         score: finalScore,
@@ -3522,7 +3363,12 @@ async function processJob(jobId) {
 
               const rowPromptOverride = buildPromptOverrideFromWriting(
                 basePrompt,
-                writing
+                writing,
+                {
+                  firstName: row.firstName || row.first_name || "",
+                  companyName: row.companyName || row.company_name || "",
+                  url: row.url || "",
+                }
               );
 
               let analysisResult = null;
@@ -3606,23 +3452,6 @@ async function processJob(jobId) {
                 );
               }
 
-              // Assemble full email: resolve opening/closing templates with per-lead values
-              const leadTokens = {
-                url: row.url || "",
-                website: row.url || "",
-                firstName: row.firstName || row.first_name || "",
-                firstname: row.firstName || row.first_name || "",
-                company: row.companyName || row.company_name || "",
-                companyName: row.companyName || row.company_name || "",
-                email: row.recipientEmail || row.email || "",
-              };
-
-              const resolvedOpening = resolveEmailSubject(writing.opening || "", leadTokens);
-              const resolvedClosing = resolveEmailSubject(writing.closing || "", leadTokens);
-              const fullEmail = [resolvedOpening, comment, resolvedClosing]
-                .filter(Boolean)
-                .join("\n\n");
-
               await consumeAnalysisCredit({
                 appUserId: meta.appUserId,
                 jobId,
@@ -3633,14 +3462,14 @@ async function processJob(jobId) {
                 pageType: finalPageType,
               });
 
-              await maybeWriteSheet(meta, row, fullEmail);
+              await maybeWriteSheet(meta, row, comment);
 
               await pushRedisResult(
                 jobId,
                 batchResult(row, {
-                  comment: fullEmail,
-                  body: fullEmail,
-                  email_body: fullEmail,
+                  comment,
+                  body: comment,
+                  email_body: comment,
                   status: finalStatus,
                   score: finalScore,
                   page_type: finalPageType,
