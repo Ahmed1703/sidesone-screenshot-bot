@@ -384,7 +384,23 @@ function textLooksLikeDeadSite(text) {
     t.includes("parked") ||
     t.includes("domain for sale") ||
     t.includes("coming soon") ||
-    t.includes("under construction")
+    t.includes("under construction") ||
+    t.includes("her kommer") ||
+    t.includes("kommer snart") ||
+    t.includes("under utvikling") ||
+    t.includes("under bygging") ||
+    t.includes("nettside kommer") ||
+    t.includes("website coming") ||
+    t.includes("site coming") ||
+    t.includes("launching soon") ||
+    t.includes("we're building") ||
+    t.includes("we are building") ||
+    t.includes("stay tuned") ||
+    t.includes("watch this space") ||
+    t.includes("vi bygger") ||
+    t.includes("siden er under") ||
+    t.includes("nettsiden er under") ||
+    /^.{0,5}www\.\S+\.\S{2,4}.{0,5}$/.test(t)
   );
 }
 
@@ -1537,7 +1553,8 @@ async function analyzeWithAI(
           "Use simple everyday language in issues and evidence. " +
           "Do not treat Norwegian language on a .no site as a weakness. " +
           "Only include the strongest clearly visible issues. " +
-          "If the page looks broken, parked, placeholder-like, or too thin to judge safely, set should_generate_comment=false.",
+          "If the page looks broken, parked, placeholder-like, or too thin to judge safely, set should_generate_comment=false. " +
+          "CRITICAL: A page that is nearly blank, shows only a domain name, says 'Her kommer' / 'Coming soon' / 'Kommer snart' / 'Under construction', or has no navigation, no sections, no footer — is a placeholder_page with score=0 and should_generate_comment=false. Do NOT treat these as real websites.",
         input: [
           {
             role: "user",
@@ -1868,7 +1885,9 @@ async function runScoreOnlyAnalysis(
                   "- Focus on visual polish, spacing, text density, clarity, button visibility, image placement, and overall first impression.\n" +
                   "- Do NOT treat Norwegian language on a .no / Norwegian local business site as a weakness.\n" +
                   "- If it looks like a 404 page, browser error, forbidden page, parked domain, domain for sale page, blank page, coming soon page, or maintenance page, set reachable=false, score=0, and page_type to unreachable, broken_page, parking_page, placeholder_page, or under_construction.\n" +
-                  "- If it looks like a real website, set page_type=real_site.\n" +
+                  "- CRITICAL: Pages that show ONLY a domain name (e.g. 'www.example.no'), 'Her kommer' / 'Coming soon' / 'Under construction' / 'Kommer snart' with no real content are NOT real websites. Set reachable=false, score=0, page_type=placeholder_page.\n" +
+                  "- Pages that are nearly blank, show only a single line of text, or have no navigation/menu/sections/footer are placeholder pages, NOT real sites.\n" +
+                  "- If it looks like a real website with actual content, navigation, and structure, set page_type=real_site.\n" +
                   "Return ONLY JSON.",
               },
               ...imagePaths.map((imgPath) => ({

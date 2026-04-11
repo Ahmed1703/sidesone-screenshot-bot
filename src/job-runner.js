@@ -6,7 +6,6 @@ const redis = Redis.fromEnv();
 const pullCsvRows = require("./pull-csv-rows");
 const pullSheetUrls = require("./pull-sheet-urls");
 const pushSheetResult = require("./push-sheet-results");
-const { deleteSheetRow } = pushSheetResult;
 const { runAnalysis, runScoreOnlyAnalysis } = require("./analyze-manifest");
 const { captureWebsite } = require("./capture");
 const { buildAnalyzerPrompt } = require("./analyzer-prompt");
@@ -31,7 +30,7 @@ function normalizeUrlForCreditKey(url) {
 function isChargeableOutcome(status) {
   return (
     status === "success" ||
-    status === "skipped" ||
+    status === "excluded" ||
     status === "good_site" ||
     status === "cleared"
   );
@@ -260,6 +259,19 @@ function normalizeLanguage(value) {
   ) {
     return "no";
   }
+  if (v === "sv" || v === "swedish" || v === "svenska") return "sv";
+  if (v === "da" || v === "danish" || v === "dansk") return "da";
+  if (v === "de" || v === "german" || v === "deutsch") return "de";
+  if (v === "fr" || v === "french" || v === "français" || v === "francais")
+    return "fr";
+  if (v === "es" || v === "spanish" || v === "español" || v === "espanol")
+    return "es";
+  if (v === "nl" || v === "dutch" || v === "nederlands") return "nl";
+  if (v === "fi" || v === "finnish" || v === "suomi") return "fi";
+  if (v === "pt" || v === "portuguese" || v === "português" || v === "portugues")
+    return "pt";
+  if (v === "it" || v === "italian" || v === "italiano") return "it";
+  if (v === "pl" || v === "polish" || v === "polski") return "pl";
 
   return "no";
 }
@@ -370,8 +382,25 @@ async function runWithRetry({
   throw lastErr;
 }
 
-function buildBatchResultPayload(row, payload = {}) {
-  return {
+function resolveEmailSubject(template, data) {
+  if (!template) return "";
+  return template.replace(/\{(\w+)\}/g, (match, key) => {
+    const map = {
+      website: data.url || data.website || "",
+      firstName: data.firstName || data.first_name || "",
+      firstname: data.firstName || data.first_name || "",
+      company: data.companyName || data.company_name || "",
+      companyName: data.companyName || data.company_name || "",
+      industry: data.industry || "",
+      location: data.location || "",
+      email: data.recipientEmail || data.email || "",
+    };
+    return map[key] !== undefined ? map[key] : match;
+  });
+}
+
+function buildBatchResultPayload(row, payload = {}, emailSubjectTemplate = "") {
+  const base = {
     url: row?.url || "",
     recipientEmail:
       row?.recipientEmail ||
@@ -385,6 +414,15 @@ function buildBatchResultPayload(row, payload = {}) {
     location: row?.location || "",
     ...payload,
   };
+  if (emailSubjectTemplate) {
+    base.emailSubject = resolveEmailSubject(emailSubjectTemplate, {
+      ...row,
+      url: base.url,
+      firstName: base.firstName,
+      companyName: base.companyName,
+    });
+  }
+  return base;
 }
 
 function toBoolean(value) {
@@ -703,6 +741,23 @@ function shouldResumeAfterVerification({
     hasVerificationResults(verificationState?.results) &&
     isVerificationReviewCompleted(meta, verificationState)
   );
+}
+
+function shouldBlockAnalysisForVerification({
+  verificationControl,
+  verificationOnlyBatch,
+  verificationState,
+  meta,
+}) {
+  if (!verificationControl?.enabled) return false;
+
+  const hasResults = hasVerificationResults(verificationState?.results);
+  const reviewCompleted = isVerificationReviewCompleted(meta, verificationState);
+
+  if (verificationOnlyBatch && hasResults) return true;
+  if (hasResults && !reviewCompleted) return true;
+
+  return false;
 }
 
 function buildRequestedVerificationIdentity(row, index = 0) {
@@ -1069,7 +1124,23 @@ function textLooksLikeDeadSite(text) {
     t.includes("parked") ||
     t.includes("domain for sale") ||
     t.includes("coming soon") ||
-    t.includes("under construction")
+    t.includes("under construction") ||
+    t.includes("her kommer") ||
+    t.includes("kommer snart") ||
+    t.includes("under utvikling") ||
+    t.includes("under bygging") ||
+    t.includes("nettside kommer") ||
+    t.includes("website coming") ||
+    t.includes("site coming") ||
+    t.includes("launching soon") ||
+    t.includes("we're building") ||
+    t.includes("we are building") ||
+    t.includes("stay tuned") ||
+    t.includes("watch this space") ||
+    t.includes("vi bygger") ||
+    t.includes("siden er under") ||
+    t.includes("nettsiden er under") ||
+    /^.{0,5}www\.\S+\.\S{2,4}.{0,5}$/.test(t)
   );
 }
 
@@ -1200,25 +1271,7 @@ function getDefaultFallbackComment(language) {
     : "Nettsiden deres ser ikke ut til å være ordentlig tilgjengelig akkurat nå, så det kan hende det er noe teknisk feil der nå.";
 }
 
-function getTooGoodMessage(language, score, action) {
-  if (language === "en") {
-    if (action === "skip") {
-      return `This website scored ${score}/10 and was skipped because it is above your current outreach threshold.`;
-    }
-    if (action === "delete") {
-      return `This website scored ${score}/10 and was removed because it is above your current outreach threshold.`;
-    }
-    return `This website scored ${score}/10 and was marked as GOOD_SITE because it is above your current outreach threshold.`;
-  }
 
-  if (action === "skip") {
-    return `Denne nettsiden fikk ${score}/10 og ble hoppet over fordi den er over outreach-grensen deres.`;
-  }
-  if (action === "delete") {
-    return `Denne nettsiden fikk ${score}/10 og ble fjernet fordi den er over outreach-grensen deres.`;
-  }
-  return `Denne nettsiden fikk ${score}/10 og ble markert som GOOD_SITE fordi den er over outreach-grensen deres.`;
-}
 
 function removeRepeatedPrefix(text, prefix) {
   const value = String(text || "").trim();
@@ -1439,11 +1492,31 @@ async function loadSystemConfig() {
   }
 }
 
+function normalizeWebsiteScoreAction(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === "write" || v === "exclude") return v;
+  return "exclude";
+}
+
+function normalizeNoWebsiteAction(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === "exclude" || v === "fallback") return v;
+  return "exclude";
+}
+
+function normalizeRulesUnreachableAction(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === "exclude" || v === "delete" || v === "fallback") return v;
+  return "exclude";
+}
+
 function getAnalysisConfig(meta, systemConfig) {
   const merged = {
     ...(systemConfig?.analysis || {}),
     ...(meta?.analysis || {}),
   };
+
+  const rules = meta?.rules || {};
 
   return {
     screenshotMode: normalizeScreenshotMode(merged.screenshotMode),
@@ -1453,7 +1526,17 @@ function getAnalysisConfig(meta, systemConfig) {
     lowScoreAction: normalizeLowScoreAction(merged.lowScoreAction),
     unreachableAction: normalizeUnreachableAction(merged.unreachableAction),
     fallbackPrompt: String(merged.fallbackPrompt || ""),
+    websiteScoreAction: normalizeWebsiteScoreAction(rules.websiteScoreAction),
+    rulesUnreachableAction: normalizeRulesUnreachableAction(rules.unreachableAction),
+    noWebsiteAction: normalizeNoWebsiteAction(rules.noWebsiteAction),
   };
+}
+
+function normalizeInitialGoal(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === "free_mockup" || v === "discovery_call" || v === "start_conversation")
+    return v;
+  return "start_conversation";
 }
 
 function getWritingConfig(meta, systemConfig) {
@@ -1462,12 +1545,19 @@ function getWritingConfig(meta, systemConfig) {
     ...(meta?.writing || {}),
   };
 
+  const rules = meta?.rules || {};
+
   return {
     language: normalizeLanguage(merged.language),
     tone: normalizeTone(merged.tone),
     outputLength: normalizeOutputLength(merged.outputLength),
     opening: safeString(merged.opening, 4000),
     closing: safeString(merged.closing, 4000),
+    emailSubject: safeString(merged.emailSubject, 500),
+    senderName: safeString(merged.senderName, 200),
+    senderCompany: safeString(merged.senderCompany, 200),
+    initialGoal: normalizeInitialGoal(rules.initialGoal),
+    includeNameCompany: toBoolean(rules.includeNameCompany ?? true),
   };
 }
 
@@ -1629,20 +1719,6 @@ async function maybeWriteSheet(meta, row, text) {
   return writeSheet(meta, row, text);
 }
 
-async function safeDeleteSheetRow(meta, rowIndex) {
-  return runWithRetry({
-    label: `deleteSheetRow row ${rowIndex}`,
-    timeoutMs: STEP_TIMEOUTS.deleteRowMs,
-    attempts: STEP_RETRIES.deleteRow,
-    fn: () =>
-      deleteSheetRow({
-        userId: meta.userId,
-        sheetId: meta.sheetId,
-        sheetTab: meta.sheetTab,
-        rowIndex,
-      }),
-  });
-}
 
 async function waitIfPausedOrStopped(jobId) {
   const freshMeta = await redis.get(`job:${jobId}:meta`);
@@ -1661,98 +1737,208 @@ async function waitIfPausedOrStopped(jobId) {
 }
 
 function buildPromptOverrideFromWriting(basePrompt, writing) {
-  const isEnglish = writing.language === "en";
+  const lang = writing.language || "no";
+  const isNorwegian = lang === "no";
+
+  // For Norwegian we keep native instructions; all others use English instructions
+  // with a language directive to produce output in the target language.
+  const t = (en, no) => (isNorwegian ? no : en);
+
+  const languageNames = {
+    en: "English", no: "Norwegian", sv: "Swedish", da: "Danish",
+    de: "German", fr: "French", es: "Spanish", nl: "Dutch",
+    fi: "Finnish", pt: "Portuguese", it: "Italian", pl: "Polish",
+  };
 
   const intro = safeString(writing.opening, 4000).trim();
   const outro = safeString(writing.closing, 4000).trim();
 
-  const defaultIntro = isEnglish
-    ? "I took a quick look through your website and noticed that"
-    : "Jeg tok en rask titt på nettsiden deres og la merke til at";
+  const senderName = String(writing.senderName || "").trim();
+  const senderCompany = String(writing.senderCompany || "").trim();
 
-  const defaultOutro = isEnglish
-    ? "Happy to share a few ideas if helpful."
-    : "Jeg kan gjerne vise noen enkle ideer om det er interessant.";
+  let defaultIntro;
+  if (writing.includeNameCompany && (senderName || senderCompany)) {
+    if (senderName && senderCompany) {
+      defaultIntro = t(
+        `Hi, I'm ${senderName} from ${senderCompany}. I took a quick look through your website and noticed that`,
+        `Hei, jeg heter ${senderName} og jobber i ${senderCompany}. Jeg tok en rask titt på nettsiden deres og la merke til at`
+      );
+    } else if (senderName) {
+      defaultIntro = t(
+        `Hi, I'm ${senderName}. I took a quick look through your website and noticed that`,
+        `Hei, jeg heter ${senderName}. Jeg tok en rask titt på nettsiden deres og la merke til at`
+      );
+    } else {
+      defaultIntro = t(
+        `Hi, I'm reaching out from ${senderCompany}. I took a quick look through your website and noticed that`,
+        `Hei, jeg tar kontakt fra ${senderCompany}. Jeg tok en rask titt på nettsiden deres og la merke til at`
+      );
+    }
+  } else {
+    defaultIntro = t(
+      "I took a quick look through your website and noticed that",
+      "Jeg tok en rask titt på nettsiden deres og la merke til at"
+    );
+  }
+
+  const defaultOutro = t(
+    "Happy to share a few ideas if helpful.",
+    "Jeg kan gjerne vise noen enkle ideer om det er interessant."
+  );
 
   const toneMap = {
-    professional: isEnglish
-      ? "Sound professional, calm, credible, and observant."
-      : "Vær profesjonell, rolig, troverdig og observant.",
-    friendly: isEnglish
-      ? "Sound friendly, natural, warm, and easy to read."
-      : "Vær vennlig, naturlig, varm og lett å lese.",
-    direct: isEnglish
-      ? "Sound direct, clear, and confident, but still polite."
-      : "Vær direkte, tydelig og trygg, men fortsatt høflig.",
-    sales: isEnglish
-      ? "Sound commercially sharp, but never pushy, cheesy, or scripted."
-      : "Vær kommersielt skarp, men aldri pushy, cheesy eller innøvd.",
-    soft: isEnglish
-      ? "Sound softer, gentler, and less harsh in the criticism."
-      : "Vær mildere, mykere og mindre hard i kritikken.",
+    professional: t(
+      "Sound professional, calm, credible, and observant.",
+      "Vær profesjonell, rolig, troverdig og observant."
+    ),
+    friendly: t(
+      "Sound friendly, natural, warm, and easy to read.",
+      "Vær vennlig, naturlig, varm og lett å lese."
+    ),
+    direct: t(
+      "Sound direct, clear, and confident, but still polite.",
+      "Vær direkte, tydelig og trygg, men fortsatt høflig."
+    ),
+    sales: t(
+      "Sound commercially sharp, but never pushy, cheesy, or scripted.",
+      "Vær kommersielt skarp, men aldri pushy, cheesy eller innøvd."
+    ),
+    soft: t(
+      "Sound softer, gentler, and less harsh in the criticism.",
+      "Vær mildere, mykere og mindre hard i kritikken."
+    ),
   };
 
   const lengthMap = {
-    one_sentence: isEnglish
-      ? "Write exactly 1 short sentence."
-      : "Skriv nøyaktig 1 kort setning.",
-    two_sentences: isEnglish
-      ? "Write exactly 2 short sentences."
-      : "Skriv nøyaktig 2 korte setninger.",
-    short_paragraph: isEnglish
-      ? "Write 3 to 4 short sentences."
-      : "Skriv 3 til 4 korte setninger.",
-    medium_paragraph: isEnglish
-      ? "Write 4 to 6 short sentences."
-      : "Skriv 4 til 6 korte setninger.",
+    one_sentence: t(
+      "Write exactly 1 short sentence.",
+      "Skriv nøyaktig 1 kort setning."
+    ),
+    two_sentences: t(
+      "Write exactly 2 short sentences.",
+      "Skriv nøyaktig 2 korte setninger."
+    ),
+    short_paragraph: t(
+      "Write 3 to 4 short sentences.",
+      "Skriv 3 til 4 korte setninger."
+    ),
+    medium_paragraph: t(
+      "Write 4 to 6 short sentences.",
+      "Skriv 4 til 6 korte setninger."
+    ),
   };
 
-  return [
+  const goalMap = {
+    free_mockup: t(
+      "The goal of this email is to offer a free mockup or redesign sample. The closing should naturally lead toward that offer.",
+      "Målet med denne e-posten er å tilby en gratis mockup eller redesign-prøve. Avslutningen skal naturlig lede mot det tilbudet."
+    ),
+    discovery_call: t(
+      "The goal of this email is to book a short discovery call. The closing should naturally lead toward scheduling a brief conversation.",
+      "Målet med denne e-posten er å booke en kort samtale. Avslutningen skal naturlig lede mot å avtale en kort prat."
+    ),
+    start_conversation: t(
+      "The goal of this email is to start a casual conversation. The closing should feel low-pressure and open-ended.",
+      "Målet med denne e-posten er å starte en uformell samtale. Avslutningen skal føles lavterskel og åpen."
+    ),
+  };
+
+  const personalisationRule = writing.includeNameCompany
+    ? t(
+        "If the lead's first name or company name is available in the context, weave it naturally into the critique. Do NOT force it if it sounds awkward.",
+        "Hvis ledens fornavn eller firmanavn er tilgjengelig i konteksten, flett det naturlig inn i kommentaren. Ikke tving det inn hvis det høres unaturlig ut."
+      )
+    : t(
+        "Do NOT use the lead's first name or company name in the output. Keep it generic.",
+        "IKKE bruk ledens fornavn eller firmanavn i teksten. Hold det generisk."
+      );
+
+  const lines = [
     String(basePrompt || "").trim(),
     "",
-    isEnglish ? "JOB RULES:" : "JOBBREGLER:",
+    t("JOB RULES:", "JOBBREGLER:"),
     toneMap[writing.tone] || toneMap.professional,
     lengthMap[writing.outputLength] || lengthMap.short_paragraph,
+    goalMap[writing.initialGoal] || goalMap.start_conversation,
+    personalisationRule,
     "",
-    isEnglish
-      ? "Write ONLY the critique section that goes between an already-written intro and an already-written outro."
-      : "Skriv KUN selve kommentardelen som skal stå mellom en allerede skrevet åpning og en allerede skrevet avslutning.",
-    isEnglish
-      ? "Do NOT greet. Do NOT introduce yourself. Do NOT say you looked at the site. Do NOT sign off. Do NOT add a CTA."
-      : "Ikke hils. Ikke introduser deg selv. Ikke skriv at du har sett på nettsiden. Ikke signer av. Ikke legg til CTA.",
-    isEnglish
-      ? "Do NOT restart the email. Do NOT repeat the intro. Do NOT repeat the outro."
-      : "Ikke start e-posten på nytt. Ikke gjenta åpningen. Ikke gjenta avslutningen.",
-    isEnglish
-      ? "Start immediately with the actual critique."
-      : "Start direkte med selve kommentaren.",
-    isEnglish
-      ? "Your output must sound like the middle of an email, not the beginning or the ending."
-      : "Outputen må høres ut som midten av en e-post, ikke starten eller slutten.",
-    isEnglish
-      ? "Never begin with phrases like: I took a quick look, I checked your website, I noticed that, Hi, Hello."
-      : "Begynn aldri med fraser som: Jeg tok en titt, Jeg så på nettsiden, Jeg la merke til at, Hei, Hallo.",
-    isEnglish
-      ? "Avoid vague filler like: the site works, could be more polished, room for improvement, a bit more spacing would help, unless tied to a specific visible element."
-      : "Unngå vag fylltekst som: nettsiden fungerer, kunne vært mer polert, rom for forbedring, litt mer luft ville hjulpet, med mindre det knyttes til et konkret synlig element.",
-    isEnglish
-      ? "Prefer concrete visible details such as contact form length, font readability, menu density, weak button visibility, heavy footer, dark background, cramped sections, isolated image/video block, dense text blocks, or awkward spacing."
-      : "Foretrekk konkrete synlige detaljer som lengden på kontaktskjema, lesbarhet i font, tett meny, svak knappesynlighet, tung footer, mørk bakgrunn, trange seksjoner, isolert bilde-/videoblokk, tette tekstblokker eller svak spacing.",
+    t(
+      "Write ONLY the critique section that goes between an already-written intro and an already-written outro.",
+      "Skriv KUN selve kommentardelen som skal stå mellom en allerede skrevet åpning og en allerede skrevet avslutning."
+    ),
+    t(
+      "Do NOT greet. Do NOT introduce yourself. Do NOT say you looked at the site. Do NOT sign off. Do NOT add a CTA.",
+      "Ikke hils. Ikke introduser deg selv. Ikke skriv at du har sett på nettsiden. Ikke signer av. Ikke legg til CTA."
+    ),
+    t(
+      "Do NOT restart the email. Do NOT repeat the intro. Do NOT repeat the outro.",
+      "Ikke start e-posten på nytt. Ikke gjenta åpningen. Ikke gjenta avslutningen."
+    ),
+    t(
+      "Start immediately with the actual critique.",
+      "Start direkte med selve kommentaren."
+    ),
+    t(
+      "Your output must sound like the middle of an email, not the beginning or the ending.",
+      "Outputen må høres ut som midten av en e-post, ikke starten eller slutten."
+    ),
+    t(
+      "Never begin with phrases like: I took a quick look, I checked your website, I noticed that, Hi, Hello.",
+      "Begynn aldri med fraser som: Jeg tok en titt, Jeg så på nettsiden, Jeg la merke til at, Hei, Hallo."
+    ),
+    t(
+      "Avoid vague filler like: the site works, could be more polished, room for improvement, a bit more spacing would help, unless tied to a specific visible element.",
+      "Unngå vag fylltekst som: nettsiden fungerer, kunne vært mer polert, rom for forbedring, litt mer luft ville hjulpet, med mindre det knyttes til et konkret synlig element."
+    ),
+    t(
+      "Prefer concrete visible details such as contact form length, font readability, menu density, weak button visibility, heavy footer, dark background, cramped sections, isolated image/video block, dense text blocks, or awkward spacing.",
+      "Foretrekk konkrete synlige detaljer som lengden på kontaktskjema, lesbarhet i font, tett meny, svak knappesynlighet, tung footer, mørk bakgrunn, trange seksjoner, isolert bilde-/videoblokk, tette tekstblokker eller svak spacing."
+    ),
     "",
-    isEnglish ? "INTRO ALREADY WRITTEN:" : "ÅPNING SOM ALLEREDE ER SKREVET:",
+    t("INTRO ALREADY WRITTEN:", "ÅPNING SOM ALLEREDE ER SKREVET:"),
     intro || defaultIntro,
     "",
-    isEnglish ? "OUTRO ALREADY WRITTEN:" : "AVSLUTNING SOM ALLEREDE ER SKREVET:",
+    t("OUTRO ALREADY WRITTEN:", "AVSLUTNING SOM ALLEREDE ER SKREVET:"),
     outro || defaultOutro,
     "",
-    isEnglish ? "Return plain text only." : "Returner kun ren tekst.",
-  ]
-    .filter(Boolean)
-    .join("\n");
+    t("Return plain text only.", "Returner kun ren tekst."),
+  ];
+
+  // For non-English, non-Norwegian languages: add a language directive at the top
+  if (!isNorwegian && lang !== "en") {
+    const langName = languageNames[lang] || lang;
+    lines.splice(
+      1,
+      0,
+      "",
+      `IMPORTANT: Write your ENTIRE output in ${langName}. Every word must be in ${langName}.`
+    );
+  }
+
+  const prompt = lines.filter(Boolean).join("\n");
+
+  if (writing.includeNameCompany && (senderName || senderCompany)) {
+    let senderCtx = t(
+      "\n\nSENDER CONTEXT (the person sending this email):",
+      "\n\nAVSENDER-KONTEKST (personen som sender denne e-posten):"
+    );
+    if (senderName) senderCtx += `\n- ${t("Name", "Navn")}: ${senderName}`;
+    if (senderCompany) senderCtx += `\n- ${t("Company", "Firma")}: ${senderCompany}`;
+    senderCtx += "\n" + t(
+      "Include a natural introduction using this name/company in the email opening.",
+      "Inkluder en naturlig introduksjon med dette navnet/firmaet i e-poståpningen."
+    );
+    return prompt + senderCtx;
+  }
+
+  return prompt;
 }
 
 function getUnreachableOutcome(cfg, analysisLanguage) {
-  if (cfg.unreachableAction === "fallback") {
+  // New rules-based unreachable action takes precedence
+  const action = cfg.rulesUnreachableAction || cfg.unreachableAction || "exclude";
+
+  if (action === "fallback") {
     return {
       out: cfg.fallbackPrompt || getDefaultFallbackComment(analysisLanguage),
       status: "fallback",
@@ -1761,17 +1947,18 @@ function getUnreachableOutcome(cfg, analysisLanguage) {
     };
   }
 
-  if (cfg.unreachableAction === "tag") {
+  if (action === "delete") {
     return {
-      out: "UNREACHABLE",
-      status: "unreachable",
-      sheetValue: "UNREACHABLE",
+      out: "",
+      status: "excluded",
+      sheetValue: "",
     };
   }
 
+  // "exclude" (default), or legacy "skip"/"tag"
   return {
-    out: "UNREACHABLE (skipped)",
-    status: "unreachable",
+    out: "",
+    status: "excluded",
     sheetValue: "",
   };
 }
@@ -1802,6 +1989,10 @@ async function processJob(jobId) {
   const systemConfig = await loadSystemConfig();
   const cfg = getAnalysisConfig(meta, systemConfig);
   const writing = getWritingConfig(meta, systemConfig);
+
+  // Pre-bind email subject template so every batch result payload resolves it automatically
+  const batchResult = (row, payload) =>
+    buildBatchResultPayload(row, payload, writing.emailSubject);
 
   delete meta.presetId;
 
@@ -1846,7 +2037,7 @@ async function processJob(jobId) {
 
   applyScreenshotEnv(cfg.screenshotMode);
 
-  const analysisLanguage = writing.language === "en" ? "en" : "no";
+  const analysisLanguage = writing.language || "no";
 
   let basePrompt = "";
   try {
@@ -1859,11 +2050,6 @@ async function processJob(jobId) {
     basePrompt = "";
   }
 
-  const writingPromptOverride = buildPromptOverrideFromWriting(
-    basePrompt,
-    writing
-  );
-
   try {
     /* =========================
        SINGLE MODE
@@ -1871,15 +2057,30 @@ async function processJob(jobId) {
     if (meta.type === "single") {
       console.log("Single job:", meta.siteUrl || "[verification only]");
 
+      const singleEmailSubject = resolveEmailSubject(writing.emailSubject, {
+        url: meta.siteUrl || "",
+        website: meta.siteUrl || "",
+      });
+
       let gate = await waitIfPausedOrStopped(jobId);
       if (gate.stopped || gate.paused) return;
 
       const verificationControl = getVerificationControl(meta);
+      const verificationOnlySingle = isVerificationOnlyBatch(
+        meta,
+        verificationControl
+      );
       const singleVerificationEmail = extractSingleVerificationEmail(meta);
+      let singleVerificationState = getPersistedVerificationState(
+        meta,
+        priorVerificationState
+      );
 
       if (verificationControl.enabled && singleVerificationEmail) {
         const existingResult =
-          meta?.verificationResults?.[0] || priorVerificationState?.results?.[0];
+          singleVerificationState?.results?.[0] ||
+          meta?.verificationResults?.[0] ||
+          priorVerificationState?.results?.[0];
 
         let verificationResult = existingResult
           ? normalizeStoredVerificationResults(
@@ -1946,8 +2147,12 @@ async function processJob(jobId) {
               },
             ]
           );
+          singleVerificationState = getPersistedVerificationState(
+            meta,
+            await redis.get(`job:${jobId}:verification`)
+          );
           verificationResult = normalizeStoredVerificationResults(
-            [verificationResult],
+            singleVerificationState?.results || [verificationResult],
             [
               {
                 recipientEmail: singleVerificationEmail,
@@ -1973,7 +2178,13 @@ async function processJob(jobId) {
           }
         }
 
-        if (!verificationControl.continueRequested) {
+        if (
+          shouldWaitForVerificationReview({
+            verificationControl,
+            verificationState: singleVerificationState,
+            meta,
+          })
+        ) {
           console.log(`[email-verify][${jobId}] Verification review required.`);
           await pushRedisResult(jobId, {
             type: "email_verification",
@@ -1996,24 +2207,49 @@ async function processJob(jobId) {
           return;
         }
 
-        console.log(`[email-verify][${jobId}] Resume after review.`);
-        await persistVerificationState(jobId, meta, {
-          ...(priorVerificationState || meta.verification || {}),
-          enabled: true,
-          phase: "completed",
-          type: "single",
-          reviewCompletedAt: nowIso(),
-          summary: buildVerificationSummary([verificationResult]),
-          results: [verificationResult],
-        }, [
-          {
-            recipientEmail: singleVerificationEmail,
-            verificationRowNumber: 1,
-            rowIndex: 1,
-          },
-        ]);
+        if (
+          shouldResumeAfterVerification({
+            verificationControl,
+            verificationState: singleVerificationState,
+            meta,
+          })
+        ) {
+          console.log(`[email-verify][${jobId}] Resume after review.`);
+          await persistVerificationState(
+            jobId,
+            meta,
+            {
+              ...(singleVerificationState || meta.verification || {}),
+              enabled: true,
+              phase: "completed",
+              type: "single",
+              reviewCompletedAt: nowIso(),
+              summary: buildVerificationSummary([verificationResult]),
+              results: [verificationResult],
+            },
+            [
+              {
+                recipientEmail: singleVerificationEmail,
+                verificationRowNumber: 1,
+                rowIndex: 1,
+              },
+            ]
+          );
+          singleVerificationState = getPersistedVerificationState(
+            meta,
+            await redis.get(`job:${jobId}:verification`)
+          );
+        }
 
-        if (!meta.siteUrl) {
+        if (
+          verificationOnlySingle ||
+          (!meta.siteUrl &&
+            shouldResumeAfterVerification({
+              verificationControl,
+              verificationState: singleVerificationState,
+              meta,
+            }))
+        ) {
           await pushRedisResult(jobId, {
             type: "email_verification",
             status: verificationResult.status,
@@ -2034,6 +2270,39 @@ async function processJob(jobId) {
           await persistMeta(jobId, meta);
           return;
         }
+      }
+
+      if (verificationControl.enabled && verificationOnlySingle && !singleVerificationEmail) {
+        await pushRedisResult(jobId, {
+          type: "email_verification",
+          status: "completed",
+          verification: {
+            type: "single",
+            provider: "bouncer",
+            email: "",
+            result: null,
+            summary: buildVerificationSummary([]),
+          },
+          createdAt: nowIso(),
+        });
+
+        meta.total = 1;
+        meta.analyzed = 1;
+        meta.status = "completed";
+        clearLiveStep(meta);
+        await persistMeta(jobId, meta);
+        return;
+      }
+
+      if (
+        shouldBlockAnalysisForVerification({
+          verificationControl,
+          verificationOnlyBatch: verificationOnlySingle,
+          verificationState: singleVerificationState,
+          meta,
+        })
+      ) {
+        return;
       }
 
       if (!meta.siteUrl) {
@@ -2166,6 +2435,7 @@ async function processJob(jobId) {
         await pushRedisResult(jobId, {
           url: meta.siteUrl,
           comment: out,
+          emailSubject: singleEmailSubject,
           status,
           score: scoreValue,
           page_type: pageType,
@@ -2208,30 +2478,22 @@ async function processJob(jobId) {
       const score = scoreValue;
       console.log("QUALIFICATION CHECK:", score, cfg.minScore);
 
-      if (score >= cfg.minScore) {
-        const action = cfg.lowScoreAction;
-        const out = getTooGoodMessage(analysisLanguage, score, action);
-        const status =
-          action === "skip"
-            ? "skipped"
-            : action === "delete"
-            ? "cleared"
-            : "good_site";
-
+      if (score >= cfg.minScore && cfg.websiteScoreAction !== "write") {
+        // Exclude: site scored too well, skip without generating content
         await consumeAnalysisCredit({
           appUserId: meta.appUserId,
           jobId,
           siteUrl: meta.siteUrl,
           rowNumber: null,
-          status,
+          status: "excluded",
           score: scoreValue,
           pageType: scoreResult?.page_type || "real_site",
         });
 
         await pushRedisResult(jobId, {
           url: meta.siteUrl,
-          comment: out,
-          status,
+          comment: "",
+          status: "excluded",
           score: scoreValue,
           page_type: scoreResult?.page_type || "real_site",
           analysis_payload: null,
@@ -2244,14 +2506,20 @@ async function processJob(jobId) {
         clearLiveStep(meta);
         await persistMeta(jobId, meta);
 
-        console.log("Single job completed (too good / high score):", jobId);
+        console.log("Single job completed (excluded / high score):", jobId);
         return;
       }
+      // If websiteScoreAction === "write", fall through to full analysis even if score >= minScore
 
       gate = await waitIfPausedOrStopped(jobId);
       if (gate.stopped || gate.paused) return;
 
       console.log("Qualified single site, starting full AI analysis...");
+
+      const singlePromptOverride = buildPromptOverrideFromWriting(
+        basePrompt,
+        writing
+      );
 
       let analysisResult = null;
       try {
@@ -2262,7 +2530,7 @@ async function processJob(jobId) {
           attempts: STEP_RETRIES.analysis,
           url: meta.siteUrl,
           fn: async () =>
-            runAnalysis(meta.siteUrl, analysisLanguage, "openai", basePrompt),
+            runAnalysis(meta.siteUrl, analysisLanguage, "openai", singlePromptOverride),
         });
       } catch (err) {
         const errorMessage = safeErrorMessage(err);
@@ -2274,6 +2542,7 @@ async function processJob(jobId) {
         await pushRedisResult(jobId, {
           url: meta.siteUrl,
           comment: fallbackComment,
+          emailSubject: singleEmailSubject,
           status: "fallback",
           score: scoreValue,
           page_type: scoreResult?.page_type || "real_site",
@@ -2326,10 +2595,26 @@ async function processJob(jobId) {
         );
       }
 
+      // Assemble full email for single mode
+      const singleLeadTokens = {
+        url: meta.siteUrl || "",
+        website: meta.siteUrl || "",
+        firstName: "",
+        firstname: "",
+        company: "",
+        companyName: "",
+        email: "",
+      };
+      const resolvedOpening = resolveEmailSubject(writing.opening || "", singleLeadTokens);
+      const resolvedClosing = resolveEmailSubject(writing.closing || "", singleLeadTokens);
+      const fullEmail = [resolvedOpening, comment, resolvedClosing]
+        .filter(Boolean)
+        .join("\n\n");
+
       meta.singleAnalysisPayload = analysisPayload;
       await persistMeta(jobId, meta);
 
-      console.log("Final extracted comment:", comment);
+      console.log("Final extracted comment:", fullEmail);
 
       await consumeAnalysisCredit({
         appUserId: meta.appUserId,
@@ -2343,7 +2628,10 @@ async function processJob(jobId) {
 
       await pushRedisResult(jobId, {
         url: meta.siteUrl,
-        comment,
+        comment: fullEmail,
+        body: fullEmail,
+        email_body: fullEmail,
+        emailSubject: singleEmailSubject,
         status: finalStatus,
         score: finalScore,
         page_type: finalPageType,
@@ -2369,11 +2657,7 @@ async function processJob(jobId) {
     ========================== */
     if (meta.type === "batch") {
       console.log("Batch mode started");
-      const rowsToDelete = [];
       const batchIsCsv = isCsvBatch(meta);
-      const shouldDeleteRowsFromSheet =
-        isSheetBatch(meta) &&
-        String(meta?.sourceType || "").toLowerCase() !== "google";
 
       let allRows = [];
 
@@ -2474,10 +2758,12 @@ async function processJob(jobId) {
         meta,
         verificationControl
       );
-      const persistedVerificationState = getPersistedVerificationState(
+
+      let persistedVerificationState = getPersistedVerificationState(
         meta,
         priorVerificationState
       );
+
       let existingVerificationResults = hasVerificationResults(
         persistedVerificationState?.results
       )
@@ -2521,7 +2807,49 @@ async function processJob(jobId) {
               },
               []
             );
-            existingVerificationResults = [];
+            persistedVerificationState = getPersistedVerificationState(
+              meta,
+              await redis.get(`job:${jobId}:verification`)
+            );
+
+            existingVerificationResults = hasVerificationResults(
+              persistedVerificationState?.results
+            )
+              ? normalizeStoredVerificationResults(
+                  persistedVerificationState.results,
+                  requestedVerificationRows
+                )
+              : [];
+
+            if (verificationOnlyBatch) {
+              await pushRedisResult(jobId, {
+                type: "email_verification",
+                status: "completed",
+                verification: {
+                  type: "batch",
+                  provider: "bouncer",
+                  emailColumn:
+                    meta.emailColumn ||
+                    meta.mailColumn ||
+                    meta.csvMailColumn ||
+                    null,
+                  summary:
+                    persistedVerificationState?.summary ||
+                    buildVerificationSummary(existingVerificationResults, 0),
+                  results: existingVerificationResults,
+                },
+                createdAt: nowIso(),
+              });
+
+              console.log(`[email-verify][${jobId}] Verification-only batch completed.`);
+              meta.total = 0;
+              meta.analyzed = 0;
+              meta.failed = 0;
+              meta.status = "completed";
+              clearLiveStep(meta);
+              await persistMeta(jobId, meta);
+              return;
+            }
           } else {
             const verificationPayload = {
               enabled: true,
@@ -2547,10 +2875,19 @@ async function processJob(jobId) {
               verificationPayload,
               requestedVerificationRows
             );
-            existingVerificationResults = normalizeStoredVerificationResults(
-              verificationRun.results,
-              requestedVerificationRows
+            persistedVerificationState = getPersistedVerificationState(
+              meta,
+              await redis.get(`job:${jobId}:verification`)
             );
+
+            existingVerificationResults = hasVerificationResults(
+              persistedVerificationState?.results
+            )
+              ? normalizeStoredVerificationResults(
+                  persistedVerificationState.results,
+                  requestedVerificationRows
+                )
+              : [];
 
             if (!meta.verificationCreditsCharged) {
               const creditResult = await consumeVerificationCredit({
@@ -2626,71 +2963,97 @@ async function processJob(jobId) {
           return;
         }
 
+        console.log(`[email-verify][${jobId}] Resume after review.`);
+
         if (
           shouldResumeAfterVerification({
             verificationControl,
             verificationState: persistedVerificationState,
             meta,
-          })
+          }) &&
+          verificationOnlyBatch
         ) {
-          console.log(`[email-verify][${jobId}] Resume after review.`);
+          const excludedCount = Math.max(
+            0,
+            Number(persistedVerificationState?.excludedRowCount) || 0
+          );
+          const verificationPayload = {
+            ...(persistedVerificationState || meta.verification || {}),
+            enabled: true,
+            phase: "completed",
+            type: "batch",
+            provider: "bouncer",
+            reviewCompletedAt: nowIso(),
+            excludedRowCount: Math.max(0, excludedCount),
+            summary: buildVerificationSummary(
+              existingVerificationResults,
+              Math.max(0, excludedCount)
+            ),
+            results: existingVerificationResults,
+          };
 
-          if (verificationOnlyBatch) {
-            const excludedCount = Math.max(
-              0,
-              Number(persistedVerificationState?.excludedRowCount) || 0
-            );
-            const verificationPayload = {
-              ...(persistedVerificationState || meta.verification || {}),
-              enabled: true,
-              phase: "completed",
+          await persistVerificationState(
+            jobId,
+            meta,
+            verificationPayload,
+            requestedVerificationRows
+          );
+          persistedVerificationState = getPersistedVerificationState(
+            meta,
+            await redis.get(`job:${jobId}:verification`)
+          );
+
+          existingVerificationResults = hasVerificationResults(
+            persistedVerificationState?.results
+          )
+            ? normalizeStoredVerificationResults(
+                persistedVerificationState.results,
+                requestedVerificationRows
+              )
+            : [];
+
+          await pushRedisResult(jobId, {
+            type: "email_verification",
+            status: "completed",
+            verification: {
               type: "batch",
               provider: "bouncer",
-              reviewCompletedAt: nowIso(),
-              excludedRowCount: Math.max(0, excludedCount),
+              emailColumn:
+                meta.emailColumn ||
+                meta.mailColumn ||
+                meta.csvMailColumn ||
+                null,
               summary: buildVerificationSummary(
                 existingVerificationResults,
                 Math.max(0, excludedCount)
               ),
               results: existingVerificationResults,
-            };
+            },
+            createdAt: nowIso(),
+          });
 
-            await persistVerificationState(
-              jobId,
-              meta,
-              verificationPayload,
-              requestedVerificationRows
-            );
+          console.log(`[email-verify][${jobId}] Verification-only batch completed.`);
+          meta.total = existingVerificationResults.length;
+          meta.analyzed = existingVerificationResults.length;
+          meta.failed = 0;
+          meta.status = "completed";
+          clearLiveStep(meta);
+          await persistMeta(jobId, meta);
+          return;
+        }
 
-            await pushRedisResult(jobId, {
-              type: "email_verification",
-              status: "completed",
-              verification: {
-                type: "batch",
-                provider: "bouncer",
-                emailColumn:
-                  meta.emailColumn ||
-                  meta.mailColumn ||
-                  meta.csvMailColumn ||
-                  null,
-                summary: buildVerificationSummary(
-                  existingVerificationResults,
-                  Math.max(0, excludedCount)
-                ),
-                results: existingVerificationResults,
-              },
-              createdAt: nowIso(),
-            });
-
-            console.log(`[email-verify][${jobId}] Verification-only batch completed.`);
-            meta.total = existingVerificationResults.length;
-            meta.analyzed = existingVerificationResults.length;
-            meta.failed = 0;
-            meta.status = "completed";
-            clearLiveStep(meta);
-            await persistMeta(jobId, meta);
-            return;
-          }
+        if (
+          shouldBlockAnalysisForVerification({
+            verificationControl,
+            verificationOnlyBatch,
+            verificationState: persistedVerificationState,
+            meta,
+          })
+        ) {
+          console.log(
+            `[email-verify][${jobId}] Analysis blocked by verification state.`
+          );
+          return;
         }
 
         const isExcluded = buildExcludedRowMatcher(meta, existingVerificationResults);
@@ -2725,6 +3088,19 @@ async function processJob(jobId) {
           verificationPayload,
           requestedVerificationRows
         );
+        persistedVerificationState = getPersistedVerificationState(
+          meta,
+          await redis.get(`job:${jobId}:verification`)
+        );
+
+        existingVerificationResults = hasVerificationResults(
+          persistedVerificationState?.results
+        )
+          ? normalizeStoredVerificationResults(
+              persistedVerificationState.results,
+              requestedVerificationRows
+            )
+          : [];
       }
 
       meta.total = rows.length;
@@ -2768,6 +3144,44 @@ async function processJob(jobId) {
 
               console.log(`Processing row ${rowNumber}/${rows.length}:`, row.url);
 
+              // Handle leads with no website URL
+              if (!row.url || !String(row.url).trim()) {
+                if (cfg.noWebsiteAction === "fallback") {
+                  const fallback =
+                    cfg.fallbackPrompt || getDefaultFallbackComment(analysisLanguage);
+                  await maybeWriteSheet(meta, row, fallback);
+                  await pushRedisResult(
+                    jobId,
+                    batchResult(row, {
+                      comment: fallback,
+                      status: "fallback",
+                      score: null,
+                      page_type: "unclear",
+                      analysis_payload: null,
+                      createdAt: nowIso(),
+                    })
+                  );
+                } else {
+                  // "exclude" — skip silently
+                  await maybeWriteSheet(meta, row, "");
+                  await pushRedisResult(
+                    jobId,
+                    batchResult(row, {
+                      comment: "",
+                      status: "excluded",
+                      score: null,
+                      page_type: "unclear",
+                      analysis_payload: null,
+                      createdAt: nowIso(),
+                    })
+                  );
+                }
+                await queueMetaUpdate(() => {
+                  meta.analyzed += 1;
+                });
+                return;
+              }
+
               let captureResult = null;
               try {
                 captureResult = await runStep(jobId, meta, {
@@ -2803,7 +3217,7 @@ async function processJob(jobId) {
 
                 await pushRedisResult(
                   jobId,
-                  buildBatchResultPayload(row, {
+                  batchResult(row, {
                     comment: unreachableOutcome.out,
                     status: unreachableOutcome.status,
                     score: null,
@@ -2852,7 +3266,7 @@ async function processJob(jobId) {
 
                 await pushRedisResult(
                   jobId,
-                  buildBatchResultPayload(row, {
+                  batchResult(row, {
                     comment: "FAILED_SCORE_STEP",
                     status: "failed",
                     score: null,
@@ -2919,7 +3333,7 @@ async function processJob(jobId) {
 
                 await pushRedisResult(
                   jobId,
-                  buildBatchResultPayload(row, {
+                  batchResult(row, {
                     comment: out,
                     status,
                     score: scoreValue,
@@ -2940,7 +3354,7 @@ async function processJob(jobId) {
 
                 await pushRedisResult(
                   jobId,
-                  buildBatchResultPayload(row, {
+                  batchResult(row, {
                     comment: "FAILED_SCORE_PARSE",
                     status: "failed",
                     score: null,
@@ -2958,113 +3372,46 @@ async function processJob(jobId) {
 
               const score = scoreValue;
 
-              if (score >= cfg.minScore) {
-                const action = cfg.lowScoreAction;
-                const text = getTooGoodMessage(analysisLanguage, score, action);
+              if (score >= cfg.minScore && cfg.websiteScoreAction !== "write") {
+                // Exclude: site scored too well, skip without generating content
+                await consumeAnalysisCredit({
+                  appUserId: meta.appUserId,
+                  jobId,
+                  siteUrl: row.url,
+                  rowNumber,
+                  status: "excluded",
+                  score: scoreValue,
+                  pageType: scoreResult?.page_type || "real_site",
+                });
 
-                if (action === "skip") {
-                  await consumeAnalysisCredit({
-                    appUserId: meta.appUserId,
-                    jobId,
-                    siteUrl: row.url,
-                    rowNumber,
-                    status: "skipped",
+                await maybeWriteSheet(meta, row, "");
+
+                await pushRedisResult(
+                  jobId,
+                  batchResult(row, {
+                    comment: "",
+                    status: "excluded",
                     score: scoreValue,
-                    pageType: scoreResult?.page_type || "real_site",
-                  });
-
-                  await maybeWriteSheet(meta, row, "");
-
-                  await pushRedisResult(
-                    jobId,
-                    buildBatchResultPayload(row, {
-                      comment: text,
-                      status: "skipped",
-                      score: scoreValue,
-                      page_type: scoreResult?.page_type || "real_site",
-                      analysis_payload: null,
-                      createdAt: nowIso(),
-                    })
-                  );
-
-                  await queueMetaUpdate(() => {
-                    meta.analyzed += 1;
-                  });
-                  return;
-                }
-
-                if (action === "tag") {
-                  await consumeAnalysisCredit({
-                    appUserId: meta.appUserId,
-                    jobId,
-                    siteUrl: row.url,
-                    rowNumber,
-                    status: "good_site",
-                    score: scoreValue,
-                    pageType: scoreResult?.page_type || "real_site",
-                  });
-
-                  await maybeWriteSheet(meta, row, `GOOD_SITE (${score}/10)`);
-
-                  await pushRedisResult(
-                    jobId,
-                    buildBatchResultPayload(row, {
-                      comment: text,
-                      status: "good_site",
-                      score: scoreValue,
-                      page_type: scoreResult?.page_type || "real_site",
-                      analysis_payload: null,
-                      createdAt: nowIso(),
-                    })
-                  );
-
-                  await queueMetaUpdate(() => {
-                    meta.analyzed += 1;
-                  });
-                  return;
-                }
-
-                if (action === "delete") {
-                  await consumeAnalysisCredit({
-                    appUserId: meta.appUserId,
-                    jobId,
-                    siteUrl: row.url,
-                    rowNumber,
-                    status: "cleared",
-                    score: scoreValue,
-                    pageType: scoreResult?.page_type || "real_site",
-                  });
-
-                  if (shouldDeleteRowsFromSheet) {
-                    rowsToDelete.push(row.rowIndex);
-                  }
-
-                  await pushRedisResult(
-                    jobId,
-                    buildBatchResultPayload(row, {
-                      comment: text,
-                      status: "cleared",
-                      score: scoreValue,
-                      page_type: scoreResult?.page_type || "real_site",
-                      analysis_payload: null,
-                      createdAt: nowIso(),
-                    })
-                  );
-
-                  await queueMetaUpdate(() => {
-                    meta.analyzed += 1;
-                  });
-                  return;
-                }
+                    page_type: scoreResult?.page_type || "real_site",
+                    analysis_payload: null,
+                    createdAt: nowIso(),
+                  })
+                );
 
                 await queueMetaUpdate(() => {
                   meta.analyzed += 1;
                 });
                 return;
               }
+              // If websiteScoreAction === "write", fall through to full analysis even if score >= minScore
 
               rowGate = await waitIfPausedOrStopped(jobId);
               if (rowGate.stopped || rowGate.paused) return;
+
+              const rowPromptOverride = buildPromptOverrideFromWriting(
+                basePrompt,
+                writing
+              );
 
               let analysisResult = null;
               try {
@@ -3080,7 +3427,7 @@ async function processJob(jobId) {
                       row.url,
                       analysisLanguage,
                       "openai",
-                      writingPromptOverride
+                      rowPromptOverride
                     ),
                 });
               } catch (err) {
@@ -3099,7 +3446,7 @@ async function processJob(jobId) {
 
                 await pushRedisResult(
                   jobId,
-                  buildBatchResultPayload(row, {
+                  batchResult(row, {
                     comment: "FAILED_ANALYSIS_STEP",
                     status: "failed",
                     score: scoreValue,
@@ -3147,6 +3494,23 @@ async function processJob(jobId) {
                 );
               }
 
+              // Assemble full email: resolve opening/closing templates with per-lead values
+              const leadTokens = {
+                url: row.url || "",
+                website: row.url || "",
+                firstName: row.firstName || row.first_name || "",
+                firstname: row.firstName || row.first_name || "",
+                company: row.companyName || row.company_name || "",
+                companyName: row.companyName || row.company_name || "",
+                email: row.recipientEmail || row.email || "",
+              };
+
+              const resolvedOpening = resolveEmailSubject(writing.opening || "", leadTokens);
+              const resolvedClosing = resolveEmailSubject(writing.closing || "", leadTokens);
+              const fullEmail = [resolvedOpening, comment, resolvedClosing]
+                .filter(Boolean)
+                .join("\n\n");
+
               await consumeAnalysisCredit({
                 appUserId: meta.appUserId,
                 jobId,
@@ -3157,12 +3521,14 @@ async function processJob(jobId) {
                 pageType: finalPageType,
               });
 
-              await maybeWriteSheet(meta, row, comment);
+              await maybeWriteSheet(meta, row, fullEmail);
 
               await pushRedisResult(
                 jobId,
-                buildBatchResultPayload(row, {
-                  comment,
+                batchResult(row, {
+                  comment: fullEmail,
+                  body: fullEmail,
+                  email_body: fullEmail,
                   status: finalStatus,
                   score: finalScore,
                   page_type: finalPageType,
@@ -3183,7 +3549,7 @@ async function processJob(jobId) {
 
               await pushRedisResult(
                 jobId,
-                buildBatchResultPayload(row, {
+                batchResult(row, {
                   comment: "FAILED",
                   status: "failed",
                   score: null,
@@ -3199,25 +3565,6 @@ async function processJob(jobId) {
             }
           })
         );
-      }
-
-      if (shouldDeleteRowsFromSheet && rowsToDelete.length > 0) {
-        const uniqueSortedRows = [...new Set(rowsToDelete)].sort((a, b) => b - a);
-
-        for (const rowIndex of uniqueSortedRows) {
-          try {
-            await runStep(jobId, meta, {
-              step: "delete_row",
-              label: "Delete sheet row",
-              timeoutMs: STEP_TIMEOUTS.deleteRowMs,
-              attempts: STEP_RETRIES.deleteRow,
-              rowIndex,
-              fn: async () => safeDeleteSheetRow(meta, rowIndex),
-            });
-          } catch (err) {
-            console.error("Failed to delete row:", rowIndex, err);
-          }
-        }
       }
 
       meta.status = "completed";

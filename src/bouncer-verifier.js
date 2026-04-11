@@ -355,6 +355,13 @@ async function createBouncerBatch(emails) {
   });
 }
 
+async function verifyBouncerBatchSync(emails) {
+  return fetchBouncerJson("/v1.1/email/verify/batch/sync", {
+    method: "POST",
+    body: JSON.stringify(emails),
+  });
+}
+
 async function getBouncerBatchStatus(batchId) {
   return fetchBouncerJson(
     `/v1.1/email/verify/batch/${encodeURIComponent(batchId)}?with-stats=true`,
@@ -373,6 +380,14 @@ async function getBouncerBatchResults(batchId) {
         Accept: "application/json",
       },
     }
+  );
+}
+
+function isBouncerCreditsError(err) {
+  const message = safeErrorMessage(err).toLowerCase();
+  return (
+    Number(err?.statusCode) === 402 ||
+    message.includes("required") && message.includes("credits")
   );
 }
 
@@ -410,6 +425,115 @@ async function verifyEmailsWithBouncerBatch(rows, { logger } = {}) {
       credits: null,
       results: localInvalidResults,
     };
+  }
+
+  try {
+    logger?.(`Bouncer batch sync started for ${validRows.length} email(s).`);
+
+    const syncResults = await verifyBouncerBatchSync(
+      validRows.map((row) => row.normalizedEmail)
+    );
+
+    if (Array.isArray(syncResults) && syncResults.length > 0) {
+      const syncResultByEmail = new Map();
+
+      for (const item of syncResults) {
+        const normalizedEmail = normalizeEmailAddress(item?.email).normalizedEmail;
+        if (normalizedEmail) {
+          syncResultByEmail.set(normalizedEmail.toLowerCase(), item);
+        }
+      }
+
+      const mappedSyncResults = validRows.map((row) => {
+        const raw = syncResultByEmail.get(row.normalizedEmail.toLowerCase());
+        const extras = {
+          rowNumber: row.verificationRowNumber,
+          rowIndex: row.rowIndex,
+          checkedAt,
+          provider: "bouncer",
+          providerAttempted: true,
+        };
+
+        if (raw && typeof raw === "object") {
+          return mapBouncerResult(raw, extras);
+        }
+
+        return buildFallbackVerificationResult(
+          row.recipientEmail,
+          {
+            ...extras,
+            providerStatus: "missing_batch_sync_result",
+            providerReason: "missing_batch_sync_result",
+          },
+          {
+            reason:
+              "Bouncer batch sync completed without a matching verification result for this email.",
+            domain: row.normalizedDomain,
+            account: row.normalizedAccount,
+          }
+        );
+      });
+
+      return {
+        mode: "batch",
+        checkedAt,
+        batch: {
+          batchId: null,
+          created: checkedAt,
+          quantity: validRows.length,
+          duplicates: 0,
+          status: "completed",
+          processed: mappedSyncResults.length,
+          credits: null,
+          stats: null,
+        },
+        credits: null,
+        results: mappedSyncResults.concat(localInvalidResults),
+      };
+    }
+  } catch (err) {
+    logger?.(`Bouncer batch sync unavailable, falling back: ${safeErrorMessage(err)}.`);
+
+    if (isBouncerCreditsError(err)) {
+      return {
+        mode: "batch",
+        checkedAt,
+        batch: {
+          batchId: null,
+          created: checkedAt,
+          quantity: validRows.length,
+          duplicates: 0,
+          status: "credits_error",
+          processed: 0,
+          credits: null,
+          stats: null,
+        },
+        credits: null,
+        results: validRows
+          .map((row) =>
+            buildFallbackVerificationResult(
+              row.recipientEmail,
+              {
+                rowNumber: row.verificationRowNumber,
+                rowIndex: row.rowIndex,
+                checkedAt,
+                provider: "bouncer",
+                providerAttempted: true,
+                providerStatus: "credits_error",
+                providerReason: safeErrorMessage(err),
+              },
+              {
+                reason: safeErrorMessage(err),
+                domain: row.normalizedDomain,
+                account: row.normalizedAccount,
+              }
+            )
+          )
+          .concat(localInvalidResults),
+      };
+    }
+
+    logger?.(`Bouncer async batch fallback started.`);
   }
 
   let creation = null;

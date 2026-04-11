@@ -8,20 +8,13 @@ const redis = Redis.fromEnv();
 function normalizePromptLanguage(language = "no") {
   const value = String(language || "").trim().toLowerCase();
 
-  if (value === "en" || value === "english") return "en";
-  if (
-    value === "no" ||
-    value === "nb" ||
-    value === "nn" ||
-    value === "norwegian" ||
-    value === "bokmal" ||
-    value === "norsk" ||
-    value === "no-no"
-  ) {
+  if (value === "no" || value === "nb" || value === "nn" || value === "norwegian" || value === "bokmal" || value === "norsk" || value === "no-no") {
     return "no";
   }
 
-  return "no";
+  // All other supported languages (en, sv, da, de, fr, es, nl, fi, pt, it, pl)
+  // use the English base prompt; language-specific output is handled in buildPromptOverrideFromWriting.
+  return "en";
 }
 
 /**
