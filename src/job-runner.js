@@ -1177,13 +1177,19 @@ const PRECHECK_TIMEOUT_MS =
  * if it's clearly unreachable/placeholder.
  */
 async function precheckUrl(url) {
+  // Ensure URL has a protocol — fetch() requires it
+  let fetchUrl = String(url || "").trim();
+  if (fetchUrl && !/^https?:\/\//i.test(fetchUrl)) {
+    fetchUrl = `https://${fetchUrl}`;
+  }
+
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), PRECHECK_TIMEOUT_MS);
 
     let res;
     try {
-      res = await fetch(url, {
+      res = await fetch(fetchUrl, {
         signal: controller.signal,
         redirect: "follow",
         headers: {
