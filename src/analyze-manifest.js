@@ -1650,23 +1650,6 @@ async function analyzeWithAI(
     });
 
     rawText = cleanGeneratedText(rawText);
-
-    if (
-      !rawText ||
-      shouldRetrySpecificRewrite(rawText, writingStructured) ||
-      isWrongLanguage(rawText, languageArg)
-    ) {
-      rawText = await runWritingPass({
-        client,
-        model,
-        outputLanguageName,
-        prompt,
-        writingStructured,
-        strictSpecificity: true,
-      });
-
-      rawText = cleanGeneratedText(rawText);
-    }
   } catch (_) {
     rawText = "";
   }

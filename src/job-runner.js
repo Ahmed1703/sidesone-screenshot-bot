@@ -162,25 +162,23 @@ async function consumeVerificationCredit({
 ========================== */
 
 const STEP_TIMEOUTS = {
-  pullRowsMs: Number(process.env.WORKER_PULL_ROWS_TIMEOUT_MS) || 45000,
-  captureMs: Number(process.env.WORKER_CAPTURE_TIMEOUT_MS) || 45000,
-  scoreMs: Number(process.env.WORKER_SCORE_TIMEOUT_MS) || 45000,
-  analysisMs: Number(process.env.WORKER_ANALYSIS_TIMEOUT_MS) || 70000,
-  writeSheetMs: Number(process.env.WORKER_WRITE_SHEET_TIMEOUT_MS) || 20000,
-  deleteRowMs: Number(process.env.WORKER_DELETE_ROW_TIMEOUT_MS) || 20000,
+  pullRowsMs: Number(process.env.WORKER_PULL_ROWS_TIMEOUT_MS) || 30000,
+  captureMs: Number(process.env.WORKER_CAPTURE_TIMEOUT_MS) || 25000,
+  scoreMs: Number(process.env.WORKER_SCORE_TIMEOUT_MS) || 25000,
+  analysisMs: Number(process.env.WORKER_ANALYSIS_TIMEOUT_MS) || 45000,
+  writeSheetMs: Number(process.env.WORKER_WRITE_SHEET_TIMEOUT_MS) || 15000,
 };
 
 const STEP_RETRIES = {
   pullRows: Number(process.env.WORKER_PULL_ROWS_RETRIES) || 1,
-  capture: Number(process.env.WORKER_CAPTURE_RETRIES) || 2,
-  score: Number(process.env.WORKER_SCORE_RETRIES) || 2,
-  analysis: Number(process.env.WORKER_ANALYSIS_RETRIES) || 2,
+  capture: Number(process.env.WORKER_CAPTURE_RETRIES) || 1,
+  score: Number(process.env.WORKER_SCORE_RETRIES) || 1,
+  analysis: Number(process.env.WORKER_ANALYSIS_RETRIES) || 1,
   writeSheet: Number(process.env.WORKER_WRITE_SHEET_RETRIES) || 2,
-  deleteRow: Number(process.env.WORKER_DELETE_ROW_RETRIES) || 2,
 };
 
 const STEP_RETRY_DELAY_MS =
-  Number(process.env.WORKER_RETRY_DELAY_MS) || 1200;
+  Number(process.env.WORKER_RETRY_DELAY_MS) || 800;
 
 /* =========================
    HELPERS
@@ -1170,6 +1168,96 @@ function textLooksLikeBrokenPage(text) {
   );
 }
 
+const PRECHECK_TIMEOUT_MS =
+  Number(process.env.WORKER_PRECHECK_TIMEOUT_MS) || 8000;
+
+/**
+ * Fast HTTP pre-check: fetch the URL and scan the raw HTML for dead-site signals.
+ * Returns { dead: false } if the site looks alive, or { dead: true, reason, pageType }
+ * if it's clearly unreachable/placeholder.
+ */
+async function precheckUrl(url) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PRECHECK_TIMEOUT_MS);
+
+    let res;
+    try {
+      res = await fetch(url, {
+        signal: controller.signal,
+        redirect: "follow",
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          Accept: "text/html,application/xhtml+xml,*/*",
+        },
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    // Hard HTTP failures
+    if (res.status >= 500) {
+      return { dead: true, reason: `HTTP ${res.status}`, pageType: "broken_page" };
+    }
+    if (res.status === 403 || res.status === 401) {
+      return { dead: true, reason: `HTTP ${res.status} Forbidden`, pageType: "broken_page" };
+    }
+    if (res.status === 404) {
+      return { dead: true, reason: "HTTP 404", pageType: "unreachable" };
+    }
+
+    // Read body text (limit to 50KB to avoid huge pages)
+    const html = await res.text().then((t) => t.slice(0, 50000));
+
+    // Strip HTML tags to get visible text
+    const visibleText = html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const lower = visibleText.toLowerCase();
+
+    // Check for dead-site phrases
+    if (textLooksLikeDeadSite(lower)) {
+      return { dead: true, reason: "Placeholder/parked content detected", pageType: "placeholder_page" };
+    }
+    if (textLooksLikeBrokenPage(lower)) {
+      return { dead: true, reason: "Error page content detected", pageType: "broken_page" };
+    }
+
+    // Extremely thin page — less than 50 characters of visible text
+    if (visibleText.length < 50) {
+      return { dead: true, reason: "Page body is nearly empty", pageType: "placeholder_page" };
+    }
+
+    return { dead: false };
+  } catch (err) {
+    const msg = String(err?.message || err || "").toLowerCase();
+
+    // DNS / connection errors = unreachable
+    if (
+      msg.includes("enotfound") ||
+      msg.includes("econnrefused") ||
+      msg.includes("econnreset") ||
+      msg.includes("etimedout") ||
+      msg.includes("abort") ||
+      msg.includes("err_name_not_resolved") ||
+      msg.includes("getaddrinfo") ||
+      msg.includes("socket hang up") ||
+      msg.includes("network")
+    ) {
+      return { dead: true, reason: "Connection failed: " + safeErrorMessage(err), pageType: "unreachable" };
+    }
+
+    // Unknown fetch error — don't block, let the normal pipeline handle it
+    console.warn("Pre-check fetch error (non-blocking):", url, safeErrorMessage(err));
+    return { dead: false };
+  }
+}
+
 function browserCaptureWorked(captureResult) {
   if (!captureResult) return false;
 
@@ -1414,7 +1502,7 @@ function getDefaultSystemConfig() {
   return {
     analysis: {
       screenshotMode: "sections",
-      concurrency: 3,
+      concurrency: 8,
       maxBatchSize: 100,
       minScore: 7,
       lowScoreAction: "skip",
@@ -3176,6 +3264,30 @@ async function processJob(jobId) {
                     })
                   );
                 }
+                await queueMetaUpdate(() => {
+                  meta.analyzed += 1;
+                });
+                return;
+              }
+
+              // Fast HTTP pre-check before expensive capture
+              const precheck = await precheckUrl(row.url);
+              if (precheck.dead) {
+                console.log(`Pre-check failed for ${row.url}: ${precheck.reason}`);
+                const unreachableOutcome = getUnreachableOutcome(cfg, analysisLanguage);
+
+                await maybeWriteSheet(meta, row, unreachableOutcome.sheetValue);
+                await pushRedisResult(
+                  jobId,
+                  batchResult(row, {
+                    comment: unreachableOutcome.out,
+                    status: unreachableOutcome.status,
+                    score: 0,
+                    page_type: precheck.pageType || "unreachable",
+                    analysis_payload: null,
+                    createdAt: nowIso(),
+                  })
+                );
                 await queueMetaUpdate(() => {
                   meta.analyzed += 1;
                 });
