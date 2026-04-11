@@ -1169,7 +1169,7 @@ function textLooksLikeBrokenPage(text) {
 }
 
 const PRECHECK_TIMEOUT_MS =
-  Number(process.env.WORKER_PRECHECK_TIMEOUT_MS) || 8000;
+  Number(process.env.WORKER_PRECHECK_TIMEOUT_MS) || 4000;
 
 /**
  * Fast HTTP pre-check: fetch the URL and scan the raw HTML for dead-site signals.
