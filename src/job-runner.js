@@ -1780,17 +1780,25 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
   // --- Closing goal ---
   const goalMap = {
     free_mockup:
-      "CLOSING GOAL: Offer to build a free mockup or redesign sample. " +
-      "Transition naturally from the critique into something like: based on what I saw, I put together a quick idea of how your site could look — or offer to do so. " +
-      "Make it feel like a gift, not a pitch. The reader should feel curious, not pressured.",
+      "CLOSING GOAL: Offer to build a free website mockup that keeps their brand but makes the site more engaging.\n" +
+      "Examples of how to close (vary it each time, pick one style or invent your own):\n" +
+      "- \"Jeg kan lage et moderne nettsideutkast som beholder merkevaren din, men gjør siden mer fengende for besøkende — helt gratis og uforpliktende. Høres det interessant ut?\"\n" +
+      "- \"I could put together a quick redesign concept for your site — no cost, no strings. Want me to give it a shot?\"\n" +
+      "- \"Hadde det passet å ta en titt på et gratis utkast til hvordan siden kunne sett ut?\"\n" +
+      "- Or just a simple casual offer in your own words. Keep it short and genuine.",
     discovery_call:
-      "CLOSING GOAL: Suggest a short call to discuss. " +
-      "Transition naturally from the critique into offering a brief conversation — something like: happy to walk you through a few ideas if you have 10 minutes this week. " +
-      "Keep it casual and low-commitment.",
+      "CLOSING GOAL: Suggest a short, casual call.\n" +
+      "Examples (vary it):\n" +
+      "- \"Har du 10 minutter en dag denne uken? Kan vise deg et par ideer.\"\n" +
+      "- \"Happy to walk you through a few ideas if you have a few minutes.\"\n" +
+      "- Or just a relaxed question. No formal meeting request.",
     start_conversation:
-      "CLOSING GOAL: Start a casual conversation. " +
-      "End with something open-ended and low-pressure — like: let me know if any of this resonates, or if you've already been thinking about updating the site. " +
-      "No hard ask. Just leave the door open.",
+      "CLOSING GOAL: Start a casual conversation. No hard ask.\n" +
+      "Examples (vary it):\n" +
+      "- \"Er dette noe dere har tenkt på?\"\n" +
+      "- \"Bare si ifra om noe av dette traff.\"\n" +
+      "- \"Let me know if any of this resonates.\"\n" +
+      "- Or just leave the door open with a simple question.",
   };
 
   // --- Build the prompt ---
@@ -1798,8 +1806,8 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
     String(basePrompt || "").trim(),
     "",
     "=== FULL EMAIL GENERATION ===",
-    "Write a COMPLETE outreach email from greeting to sign-off. Not just a section — the entire email.",
-    "First person singular only. Always say \"I\", never \"we\" or \"our team\".",
+    "Write a COMPLETE outreach email. The whole thing — greeting, body, closing.",
+    "First person singular only. Always \"I\" / \"jeg\", never \"we\" / \"vi\" or \"our team\".",
     "",
     "TONE:",
     toneMap[writing.tone] || toneMap.professional,
@@ -1811,90 +1819,91 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
     "",
   ];
 
-  // --- Recipient context ---
-  lines.push("RECIPIENT:");
-  if (recipientFirst) {
-    lines.push(`- First name: ${recipientFirst}`);
-    lines.push(`YOU MUST start the email with a greeting that includes "${recipientFirst}". Example: "Hei ${recipientFirst}," or "Hi ${recipientFirst},"`);
+  // --- Available data about the recipient ---
+  lines.push("AVAILABLE DATA ABOUT THE RECIPIENT:");
+  const hasFirst = !!recipientFirst;
+  const hasCompany = !!recipientCompany;
+  const hasUrl = !!recipientUrl;
+
+  if (hasFirst) lines.push(`- First name: ${recipientFirst}`);
+  if (hasCompany) lines.push(`- Company name: ${recipientCompany}`);
+  if (hasUrl) lines.push(`- Website: ${recipientUrl}`);
+
+  if (hasFirst && hasCompany && hasUrl) {
+    lines.push("You have all the data. Use it wisely — greet them by name, mention their company or website naturally in the body. Don't force all of it in if it sounds awkward.");
+  } else if (hasFirst && hasUrl) {
+    lines.push("You have their name and website. Greet by name. Reference the website naturally.");
+  } else if (hasUrl) {
+    lines.push("You only have their website. Use a simple greeting like \"Hei,\" and reference the website naturally.");
   } else {
-    lines.push("- No first name available.");
-    lines.push("Use a simple generic greeting like \"Hei,\" or \"Hi,\"");
+    lines.push("Very little data available. Keep the greeting simple and generic.");
   }
-  if (recipientCompany) {
-    lines.push(`- Company name: ${recipientCompany}`);
-    lines.push(`Reference "${recipientCompany}" naturally in the email body — for example when talking about their website.`);
-  }
-  if (recipientUrl) lines.push(`- Website: ${recipientUrl}`);
   lines.push("");
 
-  // --- Sender context ---
+  // --- Sender identity ---
   if (writing.includeNameCompany && (senderName || senderCompany)) {
-    lines.push("SENDER (you — the person writing this email):");
-    if (senderName) lines.push(`- Your name: ${senderName}`);
-    if (senderCompany) lines.push(`- Your company: ${senderCompany}`);
-    if (senderName && senderCompany) {
-      lines.push(`YOU MUST introduce yourself in the opening. Example: "Jeg heter ${senderName} og jobber i ${senderCompany}" or "I'm ${senderName} from ${senderCompany}".`);
-    } else if (senderName) {
-      lines.push(`YOU MUST introduce yourself in the opening. Example: "Mitt navn er ${senderName}" or "I'm ${senderName}".`);
-    } else {
-      lines.push(`YOU MUST mention your company in the opening. Example: "Jeg tar kontakt fra ${senderCompany}" or "I'm reaching out from ${senderCompany}".`);
-    }
-    lines.push(`Sign off at the end with just: ${senderName || senderCompany}`);
+    lines.push("YOUR IDENTITY (the sender):");
+    if (senderName) lines.push(`- Name: ${senderName}`);
+    if (senderCompany) lines.push(`- Company: ${senderCompany}`);
+    lines.push("Introduce yourself somewhere in the opening — but vary how you do it. Don't always use the exact same formula.");
+    lines.push("Sometimes: \"Jeg heter X og jobber i Y.\" Sometimes: \"Mitt navn er X, jeg driver Y.\" Sometimes: \"X her, fra Y.\" Sometimes weave it in mid-sentence. Be creative.");
     lines.push("");
   }
 
   // --- Email structure ---
   lines.push(
-    "EMAIL STRUCTURE (follow this order):",
-    "1. GREETING — Use the recipient's first name if provided above. Just the greeting line, then a line break.",
+    "EMAIL STRUCTURE:",
     "",
-    "2. OPENING — 1-2 sentences. Introduce yourself (if SENDER info provided) and explain how you found their site.",
-    "   CRITICAL: You MUST vary the opening every time. Pick a DIFFERENT approach from this list:",
-    "   - Mention you were browsing sites in their industry/area",
-    "   - Say their site popped up while you were researching something",
-    "   - Say you were looking at local businesses in their area",
-    "   - Say someone mentioned them or you stumbled across their site",
-    "   - Jump straight into the critique without a long preamble",
-    "   NEVER use the same opening formula twice. NEVER always say \"Jeg kom over nettsiden til [company]\".",
+    "GREETING:",
+    hasFirst
+      ? `Use "${recipientFirst}" in the greeting. "Hei ${recipientFirst}," or "Hi ${recipientFirst}," — or just "${recipientFirst}," on its own. Vary it.`
+      : "No name available. Simple greeting: \"Hei,\" or \"Hi,\"",
     "",
-    "3. CRITIQUE — The core. 2-5 sentences of specific observations about their website.",
-    "   CRITICAL RULES FOR THE CRITIQUE:",
-    "   - NEVER start with the navigation menu. That's boring and generic. Everyone has a nav menu.",
-    "   - NEVER praise the navigation menu as your first observation. Skip it entirely unless it's genuinely broken or unusual.",
-    "   - Lead with the most INTERESTING or IMPACTFUL observation — something that would make the business owner think \"wow, they actually noticed that\".",
-    "   - Good first observations: a hero image that doesn't load, text that's too small to read, a contact form buried at the bottom, a section that feels empty, colors that clash, a logo that's blurry, buttons you can barely see, too much text crammed together.",
-    "   - Bad first observations: \"the nav is clear\", \"the menu works well\", \"the layout is structured\". These are boring and sound like every AI email.",
-    "   - Mix positive and negative observations naturally. Don't always start with a positive.",
+    "OPENING (1-2 sentences):",
+    "How you found their site + who you are (if sender info provided).",
+    "Vary the approach each time. Some ideas:",
+    "- You were browsing sites in their industry",
+    "- Their site popped up while you were doing research",
+    "- You were looking at local businesses",
+    "- You stumbled across their site",
+    "- You came across their website recently",
+    "- Jump straight to the point without a long story",
+    "Pick whatever feels natural for this specific email. Don't repeat the same formula.",
     "",
-    "4. CLOSING — 1-2 sentences. Smooth natural transition from the critique into the closing goal. Not abrupt. Not salesy.",
+    "CRITIQUE (the core — 2-5 sentences):",
+    "Specific observations about their website based on the structured analysis.",
+    "- Lead with whatever is most interesting or surprising — NOT the navigation menu.",
+    "- Don't always start with a positive. Sometimes start with a problem, sometimes a neutral observation.",
+    "- Reference real visible things: hero section, text size, button visibility, spacing, images, contact form, footer, colors, fonts.",
+    "- The reader should think you actually visited their site.",
     "",
-    `5. SIGN-OFF — Just "${senderName || "your name"}" on its own line. Nothing else. No "Best regards", no "Med vennlig hilsen", no "Mvh", no title.`,
+    "CLOSING (1-2 sentences):",
+    "Smooth transition from the critique into the closing goal above.",
+    "Sometimes short and punchy. Sometimes a question. Sometimes a casual offer. Vary it.",
+    "",
+    "SIGN-OFF:",
+    senderName
+      ? `Sometimes end with just "${senderName}". Sometimes skip the sign-off entirely and just end with the closing question. Sometimes add a dash: "– ${senderName}". Keep it casual.`
+      : "End casually or just skip the sign-off entirely.",
     ""
   );
 
-  // --- Human writing rules ---
+  // --- Writing style ---
   lines.push(
-    "WRITING RULES — THIS IS CRITICAL:",
-    "- Sound like a real person who genuinely looked at their website and has something useful to say.",
-    "- Every email MUST feel different from the last one. Vary your sentence structure, word choices, and how you transition between observations.",
-    "- Use contractions in English (I'm, you'll, it's, don't). In Norwegian, write naturally and informally (du/dere).",
-    "- Keep paragraphs short. 2-3 sentences max per paragraph. Use line breaks between paragraphs.",
-    "- No bullet points. No numbered lists. Just flowing conversational text.",
-    "- BANNED PHRASES — never use any of these:",
-    "  * \"I hope this email finds you well\"",
-    "  * \"Don't hesitate to reach out\" / \"Ikke nøl med å ta kontakt\"",
-    "  * \"Looking forward to hearing from you\"",
-    "  * \"Jeg kom over nettsiden til\" (overused — vary it!)",
-    "  * \"navigasjonsmenyen er tydelig\" / \"the navigation is clear\" (boring, skip it)",
-    "  * \"Det første som slo meg\" as the opening for the critique (overused)",
-    "  * \"noe som gir et godt førsteinntrykk\" (generic)",
-    "  * \"Basert på det jeg så\" as closing opener (overused — vary it!)",
-    "- NEVER use vague filler: \"room for improvement\", \"could be more polished\", \"feel smoother\", \"stronger visually\", \"a few tweaks\" — unless tied to a specific visible element.",
-    "- Prefer concrete details: a cramped contact form, hard-to-read font, buttons that blend into the background, a heavy footer, dense text blocks, an empty hero section, a blurry logo, colors that don't work together, missing images, broken-looking sections.",
-    "- Do not mention screenshots, AI, analysis tools, or any technical process.",
-    "- Do not sound like a consultant. Use everyday words a business owner would understand.",
-    "- Do not summarize what the company does. You're critiquing the website design, not their business.",
-    "- The email should make the reader think: \"This person actually looked at my site and knows what they're talking about.\"",
+    "WRITING STYLE:",
+    "- Write like a real person sending a genuine email. Not a template. Not AI.",
+    "- Every email should feel different. Vary sentence structure, transitions, word choices.",
+    "- Keep paragraphs short. 2-3 sentences max. Use line breaks between them.",
+    "- No bullet points. No numbered lists. Flowing text.",
+    "- Use contractions (I'm, you'll, don't / har'kke, etc.). Write informally.",
+    "- Don't overuse any single phrase. If you catch yourself repeating something, change it.",
+    "- Don't always praise the navigation or menu — that's the most boring observation possible. Only mention it if it's genuinely broken.",
+    "- Don't always start the critique with \"Det første som slo meg\" or \"The first thing I noticed\" — mix it up.",
+    "- Avoid vague filler like \"room for improvement\" or \"could be more polished\" unless tied to something specific.",
+    "- Prefer concrete visible details: cramped forms, hard-to-read fonts, buttons that disappear, heavy footer, dense text, empty sections, clashing colors.",
+    "- Never mention screenshots, AI, or analysis tools. You just looked at their website.",
+    "- Don't summarize what the company does. You're critiquing their website design.",
+    "- The email should feel like it took you 3 minutes to write, not 3 seconds.",
     "",
     "Return plain text only. No HTML. No markdown. No subject line.",
   );
