@@ -1841,48 +1841,69 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
     lines.push("");
   }
 
+  // --- Variation seed (forces the AI to pick different patterns each time) ---
+  const variationStyles = [
+    "STYLE SEED: Start the critique with a PROBLEM. No positives first.",
+    "STYLE SEED: Start with a specific visual detail — color, font, or image. Not layout.",
+    "STYLE SEED: Keep this email extra short. Get to the point fast.",
+    "STYLE SEED: Start the critique with a question about their site. Like: \"Har du lagt merke til at...\"",
+    "STYLE SEED: Be direct and blunt in this one. Fewer softening words.",
+    "STYLE SEED: Focus this critique on ONE main issue and go deeper, instead of listing many.",
+    "STYLE SEED: Open the intro differently — don't say how you found their site. Just say who you are and go straight to the critique.",
+    "STYLE SEED: Make this one warmer and more encouraging. Still honest, but kind.",
+  ];
+  const seed = variationStyles[Math.floor(Math.random() * variationStyles.length)];
+
   // --- Email structure ---
   lines.push(
+    seed,
+    "",
     "EMAIL STRUCTURE:",
     "",
     "GREETING + INTRO (first 1-2 lines):",
     hasFirst
       ? `Greet with "${recipientFirst}".`
-      : "Simple greeting: \"Hei,\" or similar.",
+      : "Simple greeting.",
     hasSender
-      ? `Introduce yourself IMMEDIATELY after the greeting — your name comes FIRST, before anything else. The very first thing after \"Hei ${recipientFirst || ""},\" should be who you are. Then briefly mention how you found their site.`
-      : "Briefly mention how you came across their site.",
-    "Keep the intro SHORT. 1-2 sentences total for greeting + who you are + how you found them.",
+      ? `Your name comes FIRST right after the greeting. Then briefly how you found their site.`
+      : "Briefly how you came across their site.",
+    "Keep intro SHORT. Max 2 sentences.",
     "",
-    "CRITIQUE (the core — 2-4 sentences):",
-    "Specific observations about their website from the structured analysis.",
-    "- Skip the navigation menu. Don't mention it. It's boring.",
-    "- Lead with a real problem or interesting detail — something the business owner would care about.",
-    "- Keep sentences short and punchy. No long run-on sentences with multiple clauses.",
-    "- Each sentence should make one clear point, not three points crammed together.",
+    "IMPORTANT — DO NOT USE THESE PHRASES (they are overused and repetitive):",
+    "- \"Det første som slår meg\" / \"Det første som slo meg\"",
+    "- \"Jeg kom over nettsiden deres, X, og tok en rask titt\"",
+    "- \"noe som gjør det tungt å lese og svekker førsteinntrykket\" (two ideas in one clause)",
+    "- \"noe som svekker\" / \"noe som gjør at\" chained repeatedly",
+    "- \"Siden har en tydelig meny\" / the navigation menu (don't mention it at all)",
+    "- \"Hvis dere/du vil, kan jeg lage et gratis forslag\" (don't reuse this closing)",
+    "Instead: write FRESH phrasing every time. You are a creative writer, not a template engine.",
+    "",
+    "CRITIQUE (2-4 short sentences):",
+    "- Each sentence = ONE observation. Period. New sentence.",
+    "- Never chain two observations with \"noe som\" or \"og det gjør at\".",
+    "- Never mention the navigation menu or that the layout is structured. Boring.",
+    "- Pick the most specific, visual, interesting observations from the analysis.",
     "",
     "CLOSING (1-2 sentences):",
-    "Follow the closing goal above. Write it fresh every time — never copy the same closing twice.",
+    "Write the closing FRESH based on the goal above. Different wording every time.",
     "",
     "SIGN-OFF:",
     senderName
-      ? `End with just "${senderName}" or "– ${senderName}" or skip it entirely. No formalities.`
-      : "Skip the sign-off or end with a simple dash.",
+      ? `"– ${senderName}" or just "${senderName}" or skip it.`
+      : "Skip it or end casually.",
     ""
   );
 
   // --- Writing style ---
   lines.push(
     "WRITING STYLE:",
-    "- Sound human. Like you're writing one email to one person, not a batch.",
-    "- Short sentences. One idea per sentence. No run-on sentences with multiple \"noe som\" / \"which means\" clauses chained together.",
-    "- Short paragraphs. 2-3 sentences max. Line breaks between paragraphs.",
-    "- No bullet points or numbered lists. Just natural flowing text.",
-    "- Write informally. Contractions are good.",
-    "- Vary everything: sentence openings, transitions, word choices. Never repeat a formula.",
-    "- Concrete observations only: text too small, buttons invisible, hero section empty, images dark, footer heavy. No vague \"could be improved\" filler.",
-    "- Never mention screenshots, AI, analysis tools, or technical processes.",
-    "- Don't describe what the company does. Just critique the website design.",
+    "- Sound human. One email to one person.",
+    "- SHORT sentences. One idea each. If a sentence has \"noe som\" in it, split it into two sentences.",
+    "- Short paragraphs. Line breaks between them.",
+    "- No bullet points or lists.",
+    "- Concrete observations only. No vague filler.",
+    "- Never mention screenshots, AI, or tools.",
+    "- Don't describe what the company does.",
     "",
     "Return plain text only. No HTML. No markdown. No subject line.",
   );
