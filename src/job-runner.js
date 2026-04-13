@@ -1841,18 +1841,34 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
     lines.push("");
   }
 
-  // --- Variation seed (forces the AI to pick different patterns each time) ---
-  const variationStyles = [
-    "STYLE SEED: Start the critique with a PROBLEM. No positives first.",
-    "STYLE SEED: Start with a specific visual detail — color, font, or image. Not layout.",
-    "STYLE SEED: Keep this email extra short. Get to the point fast.",
-    "STYLE SEED: Start the critique with a question about their site. Like: \"Har du lagt merke til at...\"",
-    "STYLE SEED: Be direct and blunt in this one. Fewer softening words.",
-    "STYLE SEED: Focus this critique on ONE main issue and go deeper, instead of listing many.",
-    "STYLE SEED: Open the intro differently — don't say how you found their site. Just say who you are and go straight to the critique.",
-    "STYLE SEED: Make this one warmer and more encouraging. Still honest, but kind.",
+  // --- Variation seed (must respect tone — no "be blunt" when tone is friendly) ---
+  const friendlySeeds = [
+    "STYLE: Focus on ONE main issue and explain why fixing it would help them.",
+    "STYLE: Start with what caught your eye in a positive way, then gently point out what's holding the site back.",
+    "STYLE: Be encouraging. Frame problems as opportunities.",
+    "STYLE: Keep this one shorter than usual. Warm but brief.",
+    "STYLE: Mention something specific that shows you actually spent time looking at their site.",
   ];
-  const seed = variationStyles[Math.floor(Math.random() * variationStyles.length)];
+  const directSeeds = [
+    "STYLE: Get straight to the point. No long preamble.",
+    "STYLE: Focus on the biggest visual problem and explain it clearly.",
+    "STYLE: Keep it tight and confident.",
+    "STYLE: Lead with the most impactful observation.",
+    "STYLE: One main critique, explained well. Don't list multiple things.",
+  ];
+  const neutralSeeds = [
+    "STYLE: Balance warmth and honesty. Be genuine.",
+    "STYLE: Focus on what matters most to a business owner visiting their own site.",
+    "STYLE: Mention one specific detail that shows real attention.",
+    "STYLE: Keep a conversational flow throughout.",
+    "STYLE: Make the reader feel like you care about their business, not just selling.",
+  ];
+
+  const tone = writing.tone || "professional";
+  const seedPool = tone === "friendly" || tone === "soft" ? friendlySeeds
+    : tone === "direct" || tone === "sales" ? directSeeds
+    : neutralSeeds;
+  const seed = seedPool[Math.floor(Math.random() * seedPool.length)];
 
   // --- Email structure ---
   lines.push(
@@ -1860,36 +1876,30 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
     "",
     "EMAIL STRUCTURE:",
     "",
-    "GREETING + INTRO (first 1-2 lines):",
+    "GREETING + INTRO (2 sentences max):",
     hasFirst
       ? `Greet with "${recipientFirst}".`
       : "Simple greeting.",
     hasSender
-      ? `Your name comes FIRST right after the greeting. Then briefly how you found their site.`
-      : "Briefly how you came across their site.",
-    "Keep intro SHORT. Max 2 sentences.",
+      ? `Your name comes FIRST right after the greeting. Then mention their website.`
+      : "Mention their website briefly.",
     "",
-    "IMPORTANT — DO NOT USE THESE PHRASES (they are overused and repetitive):",
-    "- \"Det første som slår meg\" / \"Det første som slo meg\"",
-    "- \"Jeg kom over nettsiden deres, X, og tok en rask titt\"",
-    "- \"noe som gjør det tungt å lese og svekker førsteinntrykket\" (two ideas in one clause)",
-    "- \"noe som svekker\" / \"noe som gjør at\" chained repeatedly",
-    "- \"Siden har en tydelig meny\" / the navigation menu (don't mention it at all)",
-    "- \"Hvis dere/du vil, kan jeg lage et gratis forslag\" (don't reuse this closing)",
-    "Instead: write FRESH phrasing every time. You are a creative writer, not a template engine.",
+    "CRITIQUE — THIS IS THE CORE. Follow this flow:",
+    "1) Start with something POSITIVE or neutral about the site. Even if it's simple like \"nettsiden ser grei ut\" or \"the overall structure makes sense\". If you see something genuinely good, mention it. This makes the email feel fair, not like an attack.",
+    "2) Then the MAIN issue — the biggest, most obvious problem. Use a transition word: \"Samtidig\", \"Men\", \"Likevel\", \"Det som trekker ned er\", \"However\". Explain briefly WHY this hurts the site.",
+    "3) Then a SECONDARY issue — something smaller or less obvious. Connect it naturally: \"I tillegg\", \"Også\", \"En annen ting\", \"On top of that\". Briefly say why it matters.",
+    "4) Optionally: a third small detail if the email should be longer.",
+    "The critique should flow like a conversation, not a checklist. Use transition words between observations.",
     "",
-    "CRITIQUE (2-4 short sentences):",
-    "- Each sentence = ONE observation. Period. New sentence.",
-    "- Never chain two observations with \"noe som\" or \"og det gjør at\".",
-    "- Never mention the navigation menu or that the layout is structured. Boring.",
-    "- Pick the most specific, visual, interesting observations from the analysis.",
+    "NEVER mention the navigation menu. Skip it entirely.",
+    "NEVER start the critique with \"Det første som slår meg\" or \"The first thing I noticed\" — just start.",
     "",
     "CLOSING (1-2 sentences):",
-    "Write the closing FRESH based on the goal above. Different wording every time.",
+    "Transition smoothly from the critique into the closing goal. Write it in your own words. Different every time.",
     "",
     "SIGN-OFF:",
     senderName
-      ? `"– ${senderName}" or just "${senderName}" or skip it.`
+      ? `"– ${senderName}" or just "${senderName}" or skip it entirely.`
       : "Skip it or end casually.",
     ""
   );
@@ -1897,13 +1907,15 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
   // --- Writing style ---
   lines.push(
     "WRITING STYLE:",
-    "- Sound human. One email to one person.",
-    "- SHORT sentences. One idea each. If a sentence has \"noe som\" in it, split it into two sentences.",
+    "- Sound like a real person. Warm, genuine, interested in helping.",
+    "- Use transition words to keep the text flowing: \"Samtidig\", \"Likevel\", \"Men\", \"I tillegg\", \"However\", \"That said\", \"On the other hand\".",
+    "- Short sentences. One idea per sentence. Never chain with \"noe som\" — split into two sentences instead.",
     "- Short paragraphs. Line breaks between them.",
-    "- No bullet points or lists.",
-    "- Concrete observations only. No vague filler.",
+    "- No bullet points or lists. Natural flowing text.",
+    "- Concrete observations: text size, button visibility, image quality, spacing, colors, forms. No vague filler.",
     "- Never mention screenshots, AI, or tools.",
-    "- Don't describe what the company does.",
+    "- Don't describe what the company does. Critique the website design only.",
+    "- The email should feel like it took you 3 minutes to write, not 3 seconds.",
     "",
     "Return plain text only. No HTML. No markdown. No subject line.",
   );
