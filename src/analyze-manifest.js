@@ -1539,8 +1539,9 @@ async function analyzeWithAI(
           "Use simple everyday language in issues and evidence. " +
           "Do not treat Norwegian language on a .no site as a weakness. " +
           "Only include the strongest clearly visible issues. " +
-          "If the page looks broken, parked, placeholder-like, or too thin to judge safely, set should_generate_comment=false. " +
-          "CRITICAL: A page that is nearly blank, shows only a domain name, says 'Her kommer' / 'Coming soon' / 'Kommer snart' / 'Under construction', or has no navigation, no sections, no footer — is a placeholder_page with score=0 and should_generate_comment=false. Do NOT treat these as real websites.",
+          "CRITICAL DISTINCTION — real vs placeholder. An ugly, plain, outdated, or bare-looking site is NOT a placeholder. If the page contains real content (multiple links pointing to real destinations, product or service names, company information, contact details, news items, article lists, any actual information a visitor could read or act on) then it IS a real_site, even if it looks like it was built in 1995, has no images, no styling, no clear sections, no modern navigation, and no footer. Set page_type=real_site, should_generate_comment=true, and give it a LOW score. An ugly real site is the whole point of the product — it is the best kind of lead, not a reject. " +
+          "A page is only a placeholder_page / parking_page / under_construction if you can see literal placeholder signals: the words 'Coming soon' / 'Kommer snart' / 'Her kommer' / 'Under construction' / 'Site under development' / 'Parked domain' / 'Domain for sale', OR the page shows effectively nothing (just a logo, just a domain name, just 1-3 words, completely blank). If there is a wall of plain-text links or several lines of actual readable content, it is a real_site. When in doubt between 'ugly real site' and 'placeholder', choose real_site. " +
+          "should_generate_comment=false is reserved for truly unscoreable pages: broken, parked, blank, literal 'coming soon'. Never set it to false just because the design is bad or the page looks dated.",
         input: [
           {
             role: "user",
@@ -1844,8 +1845,9 @@ async function runScoreOnlyAnalysis(
                   "- Do NOT treat Norwegian language on a .no / Norwegian local business site as a weakness.\n" +
                   "- If it looks like a 404 page, browser error, forbidden page, parked domain, domain for sale page, blank page, coming soon page, or maintenance page, set reachable=false, score=0, and page_type to unreachable, broken_page, parking_page, placeholder_page, or under_construction.\n" +
                   "- CRITICAL: Pages that show ONLY a domain name (e.g. 'www.example.no'), 'Her kommer' / 'Coming soon' / 'Under construction' / 'Kommer snart' with no real content are NOT real websites. Set reachable=false, score=0, page_type=placeholder_page.\n" +
-                  "- Pages that are nearly blank, show only a single line of text, or have no navigation/menu/sections/footer are placeholder pages, NOT real sites.\n" +
-                  "- If it looks like a real website with actual content, navigation, and structure, set page_type=real_site.\n" +
+                  "- An ugly, plain, outdated, or bare-looking site is NOT a placeholder. If the page contains real content (multiple links to real destinations, product/service names, company or contact information, news items, article lists, any readable information) then it IS a real_site, even with no modern styling, no images, no clear sections, no visible footer, or a 1990s look. Set page_type=real_site and give it a LOW score. An ugly real site is a valid lead, not a reject.\n" +
+                  "- A placeholder only qualifies when you see literal placeholder signals (the words 'Coming soon', 'Under construction', 'Parked', 'Domain for sale') OR the page is effectively blank (just a logo, just a domain, only 1-3 words). A wall of plain-text links is a real_site.\n" +
+                  "- When in doubt between 'ugly real site' and 'placeholder', choose real_site.\n" +
                   "Return ONLY JSON.",
               },
               ...imagePaths.map((imgPath) => ({
