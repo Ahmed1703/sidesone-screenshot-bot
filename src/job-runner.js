@@ -276,29 +276,26 @@ function normalizeLanguage(value) {
 
 function normalizeTone(value) {
   const v = String(value || "").toLowerCase();
-  if (
-    v === "professional" ||
-    v === "friendly" ||
-    v === "direct" ||
-    v === "sales" ||
-    v === "soft"
-  ) {
+  if (v === "professional" || v === "friendly" || v === "direct") {
     return v;
   }
+  if (v === "sales") return "direct";
+  if (v === "soft") return "friendly";
   return "professional";
 }
 
 function normalizeOutputLength(value) {
   const v = String(value || "").toLowerCase();
-  if (
-    v === "one_sentence" ||
-    v === "two_sentences" ||
-    v === "short_paragraph" ||
-    v === "medium_paragraph"
-  ) {
-    return v;
+  if (v === "short" || v === "one_sentence" || v === "two_sentences") {
+    return "short";
   }
-  return "short_paragraph";
+  if (v === "medium" || v === "short_paragraph") {
+    return "medium";
+  }
+  if (v === "long" || v === "medium_paragraph") {
+    return "long";
+  }
+  return "medium";
 }
 
 function safeString(value, max = 5000) {
@@ -1432,7 +1429,7 @@ function getDefaultSystemConfig() {
     writing: {
       language: "no",
       tone: "professional",
-      outputLength: "short_paragraph",
+      outputLength: "medium",
       opening: "",
       closing: "",
     },
@@ -1762,19 +1759,16 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
 
   // --- Tone ---
   const toneMap = {
-    professional: "Professional, calm, credible, and observant. Like a skilled expert casually pointing out what they noticed.",
-    friendly: "Friendly, warm, natural, and easy to read. Like texting a colleague you respect.",
-    direct: "Direct, clear, and confident. No fluff, but still polite. Get to the point fast.",
-    sales: "Commercially sharp but never pushy or scripted. Confident about the value you bring, without overselling.",
-    soft: "Gentle and encouraging. Point out issues without making it feel like criticism. More like helpful advice from a friend.",
+    professional: "Professional, calm, credible, and observant. Structured and informative — like a skilled expert pointing out what they noticed and explaining why it matters for the business.",
+    friendly: "Friendly, warm, and personal. Reads like a genuine message from someone who noticed something and wanted to help. Less formal, more human. Focused on the person, not the pitch.",
+    direct: "Direct, clear, and confident. No buildup, no filler. States the observation and the problem plainly without softening it. Still polite, but gets straight to the point.",
   };
 
   // --- Length (for full email including greeting + critique + closing) ---
   const lengthMap = {
-    one_sentence: "Write an extremely brief email. Around 3-4 sentences total. Greeting, one sharp observation, and a short closing.",
-    two_sentences: "Write a short email. Around 4-6 sentences total. Greeting, two observations, and a closing.",
-    short_paragraph: "Write a normal-length email. Around 6-9 sentences total. Natural greeting, 3-4 critique sentences, smooth closing.",
-    medium_paragraph: "Write a detailed email. Around 9-12 sentences total. Warm greeting, 4-6 critique sentences with specifics, thoughtful closing.",
+    short: "Write a short email. 4 sentences total including the greeting. One sharp observation and a brief closing. Around 50 words.",
+    medium: "Write a normal-length email. 7 sentences total including the greeting. Natural greeting, 3-4 critique sentences, smooth closing. Around 100 words.",
+    long: "Write a detailed email. 11 sentences total including the greeting. Warm greeting, 5-6 critique sentences with specifics, thoughtful closing. Around 180 words.",
   };
 
   // --- Closing goal ---
@@ -1805,7 +1799,7 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
     toneMap[writing.tone] || toneMap.professional,
     "",
     "LENGTH:",
-    lengthMap[writing.outputLength] || lengthMap.short_paragraph,
+    lengthMap[writing.outputLength] || lengthMap.medium,
     "",
     goalMap[writing.initialGoal] || goalMap.start_conversation,
     "",
@@ -1865,8 +1859,8 @@ function buildPromptOverrideFromWriting(basePrompt, writing, leadData = {}) {
   ];
 
   const tone = writing.tone || "professional";
-  const seedPool = tone === "friendly" || tone === "soft" ? friendlySeeds
-    : tone === "direct" || tone === "sales" ? directSeeds
+  const seedPool = tone === "friendly" ? friendlySeeds
+    : tone === "direct" ? directSeeds
     : neutralSeeds;
   const seed = seedPool[Math.floor(Math.random() * seedPool.length)];
 
