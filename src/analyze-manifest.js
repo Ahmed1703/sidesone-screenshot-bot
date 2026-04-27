@@ -110,6 +110,17 @@ function cleanGeneratedText(input) {
     return match.replace(/```json/gi, "").replace(/```/g, "").trim();
   });
 
+  // Strip forbidden punctuation that the model occasionally slips through
+  // despite the prompt rules (mostly em/en-dashes in English output).
+  // Replace dashes with a period+space so the sentence still reads cleanly,
+  // and normalize curly quotes to straight quotes.
+  text = text.replace(/\s*[—–]\s*/g, ". ");
+  text = text.replace(/[“”]/g, '"');
+  text = text.replace(/[‘’]/g, "'");
+
+  // Collapse any double-period left over from "X — Y" → "X. . Y"-style edges.
+  text = text.replace(/\.\s*\./g, ".");
+
   text = text.replace(/^["'“”‘’]+|["'“”‘’]+$/g, "").trim();
   text = text.replace(/\n{3,}/g, "\n\n").trim();
   text = text.replace(/[ \t]+/g, " ").trim();
@@ -497,6 +508,58 @@ function getCurrentScreenshotMode() {
     .toLowerCase();
 }
 
+function getMobileImagePath(manifest) {
+  const candidate =
+    manifest?.mobile_top_path ||
+    (Array.isArray(manifest?.mobile_image_paths) && manifest.mobile_image_paths[0]) ||
+    null;
+  if (candidate && fs.existsSync(candidate)) return candidate;
+  return null;
+}
+
+/**
+ * Formats the manifest.seo block into a compact text summary the analyzer can
+ * scan to write SEO findings. Returns "" if no SEO data is available.
+ *
+ * Includes light hints (length thresholds, mobile-friendly check) so the model
+ * has signal-density without us hard-coding any judgment about what's "wrong".
+ */
+function formatSeoForPrompt(seo) {
+  if (!seo || typeof seo !== "object") return "";
+
+  const lines = [];
+  const pushIf = (cond, text) => { if (cond) lines.push(text); };
+
+  const titleLen = Number(seo.title_length || 0);
+  pushIf(true, `Title: ${JSON.stringify(seo.title || "")} (length ${titleLen}; healthy is 30-60)`);
+
+  const descLen = Number(seo.meta_description_length || 0);
+  pushIf(true, `Meta description: ${descLen ? JSON.stringify((seo.meta_description || "").slice(0, 200)) : "MISSING"} (length ${descLen}; healthy is 70-160)`);
+
+  pushIf(seo.canonical, `Canonical: ${seo.canonical}`);
+  pushIf(seo.language, `Lang attr: ${seo.language}`);
+
+  const vp = String(seo.viewport_meta || "");
+  const mobileFriendly = /width\s*=\s*device-width/i.test(vp);
+  pushIf(true, `Viewport meta: ${vp || "MISSING"} (mobile-friendly meta: ${mobileFriendly ? "yes" : "NO — site forces desktop width on phones"})`);
+
+  const h1Count = seo.h1?.count ?? 0;
+  const h1Texts = Array.isArray(seo.h1?.texts) ? seo.h1.texts.join(" | ") : "";
+  pushIf(true, `H1: count=${h1Count}${h1Texts ? `, text=${JSON.stringify(h1Texts).slice(0, 200)}` : ""} (healthy is exactly 1)`);
+  pushIf(true, `H2: count=${seo.h2?.count ?? 0}`);
+
+  const imgs = seo.images || {};
+  const altPct = imgs.alt_coverage_pct;
+  pushIf(true, `Images: ${imgs.total ?? 0} total, ${imgs.with_alt ?? 0} with alt text${altPct == null ? "" : ` (${altPct}% coverage)`}`);
+
+  pushIf(true, `OG tags present: title=${!!seo.og?.title}, description=${!!seo.og?.description}, image=${!!seo.og?.image}`);
+  pushIf(true, `JSON-LD structured data: ${seo.has_jsonld ? "yes" : "no"}`);
+  pushIf(true, `Favicon: ${seo.has_favicon ? "yes" : "no"}`);
+  pushIf(seo.text_encoding_issue, `Text encoding issue detected: title or meta description contains UTF-8-as-Latin-1 mojibake (e.g. "Når" appearing as "NÃ¥r"). This is a real site bug visible to Google and visitors.`);
+
+  return lines.join("\n");
+}
+
 function getImagePathsForMode(manifest) {
   const screenshotMode = getCurrentScreenshotMode();
 
@@ -582,6 +645,32 @@ function buildFallbackStructuredAnalysis(reason, languageArg = "no") {
       error_like: false,
       placeholder_like: false,
     },
+    findings: { visual: [], mobile: [], seo: [] },
+  };
+}
+
+function normalizeFindings(raw) {
+  const empty = { visual: [], mobile: [], seo: [] };
+  if (!raw || typeof raw !== "object") return empty;
+
+  const cleanCategory = (arr, max) =>
+    Array.isArray(arr)
+      ? arr
+          .map((f) => ({
+            issue: String(f?.issue || "").trim(),
+            consequence: String(f?.consequence || "").trim(),
+            severity: ["low", "medium", "high"].includes(f?.severity)
+              ? f.severity
+              : "medium",
+          }))
+          .filter((f) => f.issue && f.consequence)
+          .slice(0, max)
+      : [];
+
+  return {
+    visual: cleanCategory(raw.visual, 4),
+    mobile: cleanCategory(raw.mobile, 3),
+    seo: cleanCategory(raw.seo, 3),
   };
 }
 
@@ -629,6 +718,7 @@ function normalizeStructuredAnalysis(data, languageArg = "no") {
       error_like: Boolean(data?.visible_signals?.error_like),
       placeholder_like: Boolean(data?.visible_signals?.placeholder_like),
     },
+    findings: normalizeFindings(data?.findings),
   };
 
   if (!normalized.issues.length) {
@@ -700,6 +790,7 @@ function buildAnalysisFallbackFromManifest(manifest, languageArg = "no", reason 
           error_like: true,
           placeholder_like: true,
         },
+        findings: { visual: [], mobile: [], seo: [] },
       },
       languageArg
     );
@@ -768,6 +859,7 @@ function buildAnalysisFallbackFromManifest(manifest, languageArg = "no", reason 
         error_like: false,
         placeholder_like: false,
       },
+      findings: { visual: [], mobile: [], seo: [] },
     },
     languageArg
   );
@@ -1006,6 +1098,7 @@ function compressStructuredForWriting(structured) {
     strengths: strengths.slice(0, maxStrengths),
     issues: issues.slice(0, maxIssues),
     evidence: evidence.slice(0, maxEvidence),
+    findings: structured?.findings || { visual: [], mobile: [], seo: [] },
   };
 }
 
@@ -1366,6 +1459,55 @@ const PAGE_ANALYSIS_SCHEMA = {
         "placeholder_like",
       ],
     },
+    findings: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        visual: {
+          type: "array",
+          maxItems: 4,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              issue: { type: "string" },
+              consequence: { type: "string" },
+              severity: { type: "string", enum: ["low", "medium", "high"] },
+            },
+            required: ["issue", "consequence", "severity"],
+          },
+        },
+        mobile: {
+          type: "array",
+          maxItems: 3,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              issue: { type: "string" },
+              consequence: { type: "string" },
+              severity: { type: "string", enum: ["low", "medium", "high"] },
+            },
+            required: ["issue", "consequence", "severity"],
+          },
+        },
+        seo: {
+          type: "array",
+          maxItems: 3,
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              issue: { type: "string" },
+              consequence: { type: "string" },
+              severity: { type: "string", enum: ["low", "medium", "high"] },
+            },
+            required: ["issue", "consequence", "severity"],
+          },
+        },
+      },
+      required: ["visual", "mobile", "seo"],
+    },
   },
   required: [
     "page_type",
@@ -1377,6 +1519,7 @@ const PAGE_ANALYSIS_SCHEMA = {
     "evidence",
     "reason_short",
     "visible_signals",
+    "findings",
   ],
 };
 
@@ -1399,14 +1542,15 @@ async function runWritingPass({
       instructions:
         `You are writing a complete outreach email. ` +
         `LANGUAGE RULE — THIS IS ABSOLUTE: Every single word in the email must be in ${outputLanguageName}. ` +
-        `The greeting must be in ${outputLanguageName}. The closing must be in ${outputLanguageName}. The sign-off must be in ${outputLanguageName}. ` +
+        `The greeting must be in ${outputLanguageName}. The closing must be in ${outputLanguageName}. ` +
         `Do NOT mix languages. Do NOT use English words if the language is not English. ` +
         `For example, if writing in Norwegian: "Hei" not "Hi", "Hei der" not "Hei there", "nettsiden" not "website". ` +
-        `Follow the WRITING RULES exactly — they specify the recipient name, sender name, tone, structure, and closing goal. ` +
+        `Follow the WRITING RULES exactly — they specify the recipient name, sender name, tone, structure, finding selection, and closing goal. ` +
         `If the rules provide a SENDER section with a name and company, you MUST introduce yourself using that name and company in the opening. This is not optional. ` +
         `If the rules provide a RECIPIENT section with a first name, you MUST use that name in the greeting. ` +
-        `Use the structured website analysis as the factual basis for the critique. Do not invent observations. ` +
+        `Use the WEBSITE ANALYSIS (especially the findings.visual / findings.mobile / findings.seo arrays) as the factual basis for the critique. Do not invent observations. Skip categories where findings are empty — never announce them, never give filler praise. ` +
         `Sound like a real human, not a template. Vary your phrasing. ` +
+        `End the body on the closing sentence with NO sign-off — no name, no "Mvh", no "Best regards", nothing. A signature is appended automatically downstream. ` +
         `Return plain text only. No HTML. No markdown. No subject line.`,
       input: [
         {
@@ -1430,9 +1574,10 @@ CHECKLIST — verify before returning:
 - Did you use the recipient's first name in the greeting (if provided in RECIPIENT section)?
 - Did you introduce yourself with sender name and company (if provided in SENDER section)?
 - Is every word in ${outputLanguageName}? No English words mixed in?
-- Did you reference specific website elements from the analysis?
+- Did you draw findings from the WEBSITE ANALYSIS (findings.visual / mobile / seo) as instructed in the WRITING RULES, weaving them into one flowing message instead of listing them?
+- Did you skip categories where findings are empty without announcing them?
 - Does the closing match the CLOSING GOAL from the rules?
-- Did you sign off with just the sender's first name?
+- The body MUST end on the closing sentence with NO sign-off, NO name at the bottom, NO "Mvh"/"Hilsen"/"Best regards"/"Thanks". A signature is appended automatically after the body.
 
 Write the email now. Every word in ${outputLanguageName}.`,
             },
@@ -1469,7 +1614,18 @@ async function analyzeWithAI(
   }
 
   const apiKey = process.env.OPENAI_API_KEY;
-  const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+  // Two distinct models: a cheap/fast one for the structured classify pass,
+  // and a stronger one for the user-facing email writing pass. Voice quality
+  // (avoiding corporate filler, foreign-language leaks, etc.) depends heavily
+  // on the writing model.
+  const classifyModel =
+    process.env.OPENAI_MODEL_SCORE ||
+    process.env.OPENAI_MODEL ||
+    "gpt-4.1-mini";
+  const writingModel =
+    process.env.OPENAI_MODEL_COMMENT ||
+    process.env.OPENAI_MODEL ||
+    classifyModel;
   if (!apiKey) throw new Error("OPENAI_API_KEY is missing in .env");
 
   const screenshotMode = getCurrentScreenshotMode();
@@ -1504,10 +1660,57 @@ async function analyzeWithAI(
     }x${manifest.viewport_desktop?.height || 900}\n` +
     `- Image order: ${imagePaths.length === 3 ? "TOP, MID, BOTTOM" : "TOP"}\n`;
 
-  const imageContent = imagePaths.map((imgPath) => ({
-    type: "input_image",
-    image_url: imageToDataUrl(imgPath),
-  }));
+  const mobileImagePath = getMobileImagePath(manifest);
+  const seoSummary = formatSeoForPrompt(manifest.seo);
+
+  // Build the user content as a labeled sequence so the model knows which
+  // image is desktop vs mobile, and reads SEO context as text.
+  const userContent = [
+    { type: "input_text", text: `${sharedContext}\nDESKTOP SCREENSHOT${imagePaths.length > 1 ? "S (in order: top, mid, bottom)" : ""}:` },
+    ...imagePaths.map((imgPath) => ({
+      type: "input_image",
+      image_url: imageToDataUrl(imgPath),
+    })),
+  ];
+
+  if (mobileImagePath) {
+    userContent.push({
+      type: "input_text",
+      text: `\nMOBILE HERO (iPhone emulation, viewport 390x664, real mobile UA — this is what a phone visitor actually sees above the fold):`,
+    });
+    userContent.push({
+      type: "input_image",
+      image_url: imageToDataUrl(mobileImagePath),
+    });
+  }
+
+  if (seoSummary) {
+    userContent.push({
+      type: "input_text",
+      text:
+        `\nSEO SIGNALS (scraped from the live page DOM — these are facts, not guesses):\n${seoSummary}`,
+    });
+  }
+
+  userContent.push({
+    type: "input_text",
+    text:
+      `\nTask:\n` +
+      `1. Classify the page strictly (page_type, score, etc).\n` +
+      `2. Fill the findings object with categorized observations:\n` +
+      `   - findings.visual: design/layout/clarity issues you can see in the DESKTOP screenshots.\n` +
+      `   - findings.mobile: issues specific to the MOBILE hero shot OR derived from SEO viewport meta. Examples: hero text too small on phone, CTA hidden below fold, broken nav, viewport meta forces desktop width on phones.\n` +
+      `   - findings.seo: issues derived ONLY from the SEO SIGNALS block above. Examples: title is just the domain, meta description missing/too long, no H1 or many H1s, low alt-text coverage on images, broken charset (mojibake), no og:image for social sharing.\n` +
+      `3. Each finding must have:\n` +
+      `   - issue: WHAT is wrong, in plain everyday language. One short sentence.\n` +
+      `   - consequence: the human cost — what it means for a real visitor or for the business. NOT "reduces conversion rate". Instead: "people leave before they understand what you do", "phones don't ring", "you're invisible when someone Googles your service".\n` +
+      `   - severity: low/medium/high based on how badly it hurts the visitor experience or discoverability.\n` +
+      `4. CRITICAL — leave a category as an empty array [] if there is genuinely nothing wrong there. Do NOT pad. A site with a great SEO setup and a clean mobile experience should have findings.seo: [] and findings.mobile: []. Only include real, verifiable problems.\n` +
+      `5. Do NOT include praise in findings — those are issues only. Use strengths[] for positives.\n` +
+      `6. Do NOT speculate about anything not visible in the screenshots or SEO data. If you cannot prove it, do not include it.\n` +
+      `7. The legacy strengths/issues/evidence fields stay in use — fill them as before. The new findings object is in addition.\n` +
+      `8. Do not write outreach text yet. Return classification data only.\n`,
+  });
 
   let structured;
   let rawStructuredText = "";
@@ -1516,7 +1719,7 @@ async function analyzeWithAI(
     const classifyResponse = await createOpenAIResponse(
       client,
       {
-        model,
+        model: classifyModel,
         temperature: 0.2,
         text: {
           format: {
@@ -1541,27 +1744,15 @@ async function analyzeWithAI(
           "Only include the strongest clearly visible issues. " +
           "CRITICAL DISTINCTION — real vs placeholder. An ugly, plain, outdated, or bare-looking site is NOT a placeholder. If the page contains real content (multiple links pointing to real destinations, product or service names, company information, contact details, news items, article lists, any actual information a visitor could read or act on) then it IS a real_site, even if it looks like it was built in 1995, has no images, no styling, no clear sections, no modern navigation, and no footer. Set page_type=real_site, should_generate_comment=true, and give it a LOW score. An ugly real site is the whole point of the product — it is the best kind of lead, not a reject. " +
           "A page is only a placeholder_page / parking_page / under_construction if you can see literal placeholder signals: the words 'Coming soon' / 'Kommer snart' / 'Her kommer' / 'Under construction' / 'Site under development' / 'Parked domain' / 'Domain for sale', OR the page shows effectively nothing (just a logo, just a domain name, just 1-3 words, completely blank). If there is a wall of plain-text links or several lines of actual readable content, it is a real_site. When in doubt between 'ugly real site' and 'placeholder', choose real_site. " +
-          "should_generate_comment=false is reserved for truly unscoreable pages: broken, parked, blank, literal 'coming soon'. Never set it to false just because the design is bad or the page looks dated.",
+          "should_generate_comment=false is reserved for truly unscoreable pages: broken, parked, blank, literal 'coming soon'. Never set it to false just because the design is bad or the page looks dated. " +
+          "FINDINGS — when filling findings.visual / findings.mobile / findings.seo, write the issue and consequence in everyday language a small business owner would understand. Each consequence must name a real human cost: people leaving, not trusting the site, not calling, not finding the business in search. Never use jargon like 'bounce rate' or 'conversion' or 'CTR'. Keep severity honest — most things are 'medium'; reserve 'high' for issues that genuinely lose customers (broken mobile layout, invisible CTA, page invisible in search). Empty arrays are correct and expected when a category is genuinely fine.",
         input: [
           {
             role: "user",
-            content: [
-              {
-                type: "input_text",
-                text:
-                  `${sharedContext}\n` +
-                  `Task:\n` +
-                  `1. Classify the page strictly.\n` +
-                  `2. Decide whether it is appropriate to generate a normal website comment.\n` +
-                  `3. Include strengths only if they are truly visible.\n` +
-                  `4. Evidence must sound like direct visual observation.\n` +
-                  `5. Do not write outreach text yet. Return classification data only.\n`,
-              },
-              ...imageContent,
-            ],
+            content: userContent,
           },
         ],
-        max_output_tokens: 900,
+        max_output_tokens: 1400,
       },
       OPENAI_CLASSIFY_TIMEOUT_MS,
       "OpenAI classify"
@@ -1606,7 +1797,7 @@ async function analyzeWithAI(
 
     return {
       mode: "openai",
-      model,
+      model: writingModel,
       screenshotModeUsed: screenshotMode,
       page_type: structured.page_type,
       confidence: structured.confidence,
@@ -1629,7 +1820,7 @@ async function analyzeWithAI(
   try {
     rawText = await runWritingPass({
       client,
-      model,
+      model: writingModel,
       outputLanguageName,
       prompt,
       writingStructured,
@@ -1650,7 +1841,7 @@ async function analyzeWithAI(
 
   return {
     mode: "openai",
-    model,
+    model: writingModel,
     screenshotModeUsed: screenshotMode,
     page_type: structured.page_type,
     confidence: structured.confidence,
@@ -1814,7 +2005,10 @@ async function runScoreOnlyAnalysis(
   }
 
   const apiKey = process.env.OPENAI_API_KEY;
-  const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+  const model =
+    process.env.OPENAI_MODEL_SCORE ||
+    process.env.OPENAI_MODEL ||
+    "gpt-4.1-mini";
   if (!apiKey) {
     return buildScoreFallbackFromManifest(manifest, "OPENAI_API_KEY missing");
   }

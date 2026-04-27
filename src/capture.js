@@ -3,7 +3,16 @@ require("dotenv").config();
 
 const fs = require("fs");
 const path = require("path");
-const { chromium } = require("playwright");
+const { chromium, devices } = require("playwright");
+
+const MOBILE_DEVICE = devices["iPhone 13"] || {
+  viewport: { width: 390, height: 844 },
+  userAgent:
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1",
+  deviceScaleFactor: 3,
+  isMobile: true,
+  hasTouch: true,
+};
 
 // Output stays on D:
 const DEFAULT_OUT_DIR =
@@ -14,10 +23,11 @@ const DEFAULT_OUT_DIR =
 const OUT_DIR = process.env.OUTPUT_DIR || DEFAULT_OUT_DIR;
 
 const DESKTOP_DIR = path.join(OUT_DIR, "screenshots", "desktop");
+const MOBILE_DIR = path.join(OUT_DIR, "screenshots", "mobile");
 const MANIFEST_DIR = path.join(OUT_DIR, "manifests");
 const LOGS_DIR = path.join(OUT_DIR, "logs");
 
-[DESKTOP_DIR, MANIFEST_DIR, LOGS_DIR].forEach((dir) => {
+[DESKTOP_DIR, MOBILE_DIR, MANIFEST_DIR, LOGS_DIR].forEach((dir) => {
   fs.mkdirSync(dir, { recursive: true });
 });
 
@@ -26,6 +36,10 @@ const LOGS_DIR = path.join(OUT_DIR, "logs");
 ========================== */
 
 const DEFAULT_VIEWPORT = { width: 1440, height: 900 };
+const MOBILE_VIEWPORT = MOBILE_DEVICE.viewport || { width: 390, height: 844 };
+
+const MOBILE_CAPTURE_ENABLED = String(process.env.CAPTURE_MOBILE_ENABLED || "true").toLowerCase() !== "false";
+const MOBILE_TOTAL_TIMEOUT_MS = Number(process.env.CAPTURE_MOBILE_TOTAL_TIMEOUT_MS) || 30000;
 
 const CAPTURE_TOTAL_TIMEOUT_MS =
   Number(process.env.CAPTURE_TOTAL_TIMEOUT_MS) || 45000;
@@ -265,6 +279,86 @@ async function tryGoto(page, rawUrl) {
   return { ok: false, error: lastError };
 }
 
+/**
+ * Scrapes SEO-relevant signals from the currently-loaded page in one round-trip
+ * so the analyzer can write a critique grounded in real data instead of guesses.
+ *
+ * Returns null on failure (best-effort: never throws).
+ */
+async function extractSeoSignals(page) {
+  try {
+    return await page.evaluate(() => {
+      const trim = (s) => (s == null ? "" : String(s).trim());
+      const meta = (selector) => trim(document.querySelector(selector)?.getAttribute("content"));
+
+      const titleText = trim(document.title);
+
+      const h1Nodes = Array.from(document.querySelectorAll("h1"));
+      const h2Nodes = Array.from(document.querySelectorAll("h2"));
+
+      const h1Texts = h1Nodes
+        .map((n) => trim(n.textContent).replace(/\s+/g, " "))
+        .filter(Boolean)
+        .slice(0, 5);
+
+      const allImages = Array.from(document.querySelectorAll("img"));
+      // Only count images that are actually visible content (not 1x1 pixels,
+      // tracking pixels, or decorative SVG-as-img with no real src).
+      const contentImages = allImages.filter((img) => {
+        const w = img.naturalWidth || img.width || 0;
+        const h = img.naturalHeight || img.height || 0;
+        return w >= 32 && h >= 32;
+      });
+      const imagesWithAlt = contentImages.filter((img) => trim(img.getAttribute("alt")).length > 0);
+
+      const canonical = trim(document.querySelector('link[rel="canonical"]')?.getAttribute("href"));
+      const lang = trim(document.documentElement?.getAttribute("lang"));
+
+      const viewportContent = meta('meta[name="viewport"]');
+      const hasViewportMeta = viewportContent.length > 0;
+
+      const ogTitle = meta('meta[property="og:title"]');
+      const ogDescription = meta('meta[property="og:description"]');
+      const ogImage = meta('meta[property="og:image"]');
+
+      const hasJsonLd = !!document.querySelector('script[type="application/ld+json"]');
+      const hasFavicon = !!document.querySelector('link[rel*="icon"]');
+      const description = meta('meta[name="description"]');
+
+      return {
+        title: titleText,
+        title_length: titleText.length,
+        meta_description: description,
+        meta_description_length: description.length,
+        canonical,
+        language: lang,
+        viewport_meta: viewportContent,
+        has_viewport_meta: hasViewportMeta,
+        h1: { count: h1Nodes.length, texts: h1Texts },
+        h2: { count: h2Nodes.length },
+        images: {
+          total: contentImages.length,
+          with_alt: imagesWithAlt.length,
+          alt_coverage_pct:
+            contentImages.length === 0
+              ? null
+              : Math.round((imagesWithAlt.length / contentImages.length) * 100),
+        },
+        og: {
+          title: ogTitle,
+          description: ogDescription,
+          image: ogImage,
+          has_any: !!(ogTitle || ogDescription || ogImage),
+        },
+        has_jsonld: hasJsonLd,
+        has_favicon: hasFavicon,
+      };
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
 async function getPageMetrics(page) {
   try {
     return await page.evaluate(() => {
@@ -377,6 +471,95 @@ async function captureSections(page, outDir, fileBase, result) {
 }
 
 /**
+ * Mobile capture. Opens a NEW browser context with iPhone device emulation
+ * (mobile viewport + mobile UA + touch), navigates fresh to the URL, and takes
+ * a single hero-viewport screenshot (390×844).
+ *
+ * Why a fresh context: just resizing the desktop viewport does not trigger the
+ * site's mobile layout because the user-agent stays desktop and many sites
+ * UA-sniff or ship different markup to phones. Fresh navigation in a mobile
+ * context is the only way to see what a phone visitor actually sees.
+ *
+ * Why hero only: full-page mobile screenshots end up extreme aspect ratios
+ * (1:15+) that vision models squash to ~100px wide internally, killing
+ * legibility. A single viewport shot stays at 1:2.2 and is fully readable.
+ * The hero is also where most mobile UX problems show up first (broken nav,
+ * squashed text, hidden CTA, layout breakage).
+ *
+ * Best-effort: a failure here only records a warning, never throws, so the
+ * desktop result is preserved.
+ */
+async function captureMobile(browser, rawUrl, fileBase, result) {
+  let mobileContext = null;
+  let mobilePage = null;
+  let timedOut = false;
+
+  const watchdog = setTimeout(() => {
+    timedOut = true;
+  }, MOBILE_TOTAL_TIMEOUT_MS);
+
+  if (typeof watchdog.unref === "function") {
+    watchdog.unref();
+  }
+
+  try {
+    mobileContext = await browser.newContext({
+      ...MOBILE_DEVICE,
+      // Override iPhone's native 3x DPR. We only need legibility for the vision
+      // model, not retina sharpness — and 3x makes the screenshot 9x larger,
+      // pushing tall pages past what vision models can downsample without
+      // losing body text.
+      deviceScaleFactor: 1,
+      ignoreHTTPSErrors: true,
+      javaScriptEnabled: true,
+    });
+
+    mobilePage = await mobileContext.newPage();
+    mobilePage.setDefaultNavigationTimeout(NAV_TIMEOUT_MS);
+    mobilePage.setDefaultTimeout(ACTION_TIMEOUT_MS);
+
+    await installLightweightBlocking(mobilePage);
+
+    const nav = await tryGoto(mobilePage, rawUrl);
+    if (!nav.ok) throw nav.error || new Error("Mobile navigation failed.");
+
+    result.viewport_mobile = { ...MOBILE_VIEWPORT };
+    result.mobile_user_agent = MOBILE_DEVICE.userAgent || null;
+
+    await shortSettle(mobilePage);
+    await dismissCommonPopups(mobilePage);
+    await autoScroll(mobilePage);
+    await mobilePage.waitForTimeout(500);
+    await scrollTo(mobilePage, 0, 400);
+
+    if (timedOut) throw new Error(`Mobile capture timed out after ${MOBILE_TOTAL_TIMEOUT_MS}ms`);
+
+    const metrics = await getPageMetrics(mobilePage);
+    result.mobile_page_height = metrics.pageHeight || 0;
+
+    const topPath = path.join(MOBILE_DIR, `${fileBase}_mobile_top.jpg`);
+    await mobilePage.screenshot({
+      path: topPath,
+      type: "jpeg",
+      quality: 75,
+      timeout: SCREENSHOT_TIMEOUT_MS,
+    });
+    result.mobile_top_path = topPath;
+    result.mobile_image_paths = [topPath];
+  } catch (err) {
+    const msg = timedOut
+      ? `Mobile capture timed out after ${MOBILE_TOTAL_TIMEOUT_MS}ms`
+      : safeErrorMessage(err, "Mobile capture failed");
+    result.mobile_capture_warning = msg;
+    result.mobile_image_paths = result.mobile_image_paths || [];
+  } finally {
+    clearTimeout(watchdog);
+    await safeClose(mobilePage, "mobile page");
+    await safeClose(mobileContext, "mobile context");
+  }
+}
+
+/**
  * captureWebsite(rawUrl, {
  *   screenshotMode?: "top"|"full"|"sections"|"recommended"|...legacy,
  *   outDir?: string,
@@ -415,9 +598,17 @@ async function captureWebsite(rawUrl, opts = {}) {
     desktop_bottom_path: null,
     desktop_full_path: null,
 
+    mobile_top_path: null,
+    mobile_image_paths: [],
+    mobile_page_height: null,
+    mobile_capture_warning: null,
+
+    seo: null,
+
     image_paths: [],
 
     viewport_desktop: { ...DEFAULT_VIEWPORT },
+    viewport_mobile: null,
     page_height: null,
     top_scroll_y: 0,
     mid_scroll_y: null,
@@ -526,6 +717,36 @@ async function captureWebsite(rawUrl, opts = {}) {
       }
     } else {
       await captureSections(page, outDir, fileBase, result);
+    }
+
+    // Scrape SEO signals from the still-loaded desktop page. Runs before we
+    // close anything so we get one DOM snapshot per site without a second
+    // navigation. Best-effort: failures leave result.seo as null.
+    result.seo = await extractSeoSignals(page);
+    if (result.seo) {
+      // Flag UTF-8-as-Latin-1 mojibake (e.g. "Når" appearing as "NÃ¥r").
+      // It's a real site bug — Google + visitors see the garbled text — so
+      // the analyzer should be able to call it out instead of treating the
+      // noisy characters as random.
+      const mojibakeRe = /[ÃÂ][\x80-\xBF]/;
+      const candidates = [
+        result.seo.title,
+        result.seo.meta_description,
+        result.seo.og?.title,
+        result.seo.og?.description,
+      ];
+      result.seo.text_encoding_issue = candidates.some(
+        (s) => typeof s === "string" && mojibakeRe.test(s)
+      );
+    }
+
+    // Desktop is done. Stop the overall watchdog so a slow mobile pass cannot
+    // overwrite the desktop result as "failed". captureMobile has its own
+    // internal time budget.
+    clearTimeout(watchdog);
+
+    if (MOBILE_CAPTURE_ENABLED) {
+      await captureMobile(browser, rawUrl, fileBase, result);
     }
 
     result.capture_status = "success";
